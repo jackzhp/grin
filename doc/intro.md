@@ -173,7 +173,7 @@ You need to build a simple transaction such that:
 
     Xi => Y
 
-Where _Xi_ is an input that spends your _X_ output and _Y_ is Carol's output. There is no way to build
+Where _Xi_ is an input that spends your _X_ output and _Y_ will be the output for Carol. There is no way to build
 such a transaction and balance it without knowing your private key of 28. Indeed, if Carol
 is to balance this transaction, she needs to know both the value sent and your private key
 so that:
@@ -183,7 +183,7 @@ so that:
 By checking that everything has been zeroed out, we can again make sure that
 no new money has been created.
 
-Wait! Stop! Now you know the private key in Carol's output (which, in this case, must
+Wait! Stop! Now you know the private key in the output (which is supposed to be owned by Carol, in this case, must
 be the same as yours to balance out) and so you could
 steal the money back from Carol!
 
