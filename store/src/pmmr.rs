@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,17 +13,18 @@
 
 //! Implementation of the persistent Backend for the prunable MMR tree.
 
-use std::fs::{self, File};
+use std::fs;
 use std::{io, time};
 
 use crate::core::core::hash::{Hash, Hashed};
 use crate::core::core::pmmr::{self, family, Backend};
 use crate::core::core::BlockHeader;
-use crate::core::ser::{FixedLength, PMMRable, ProtocolVersion};
+use crate::core::ser::{PMMRable, ProtocolVersion};
 use crate::leaf_set::LeafSet;
 use crate::prune_list::PruneList;
 use crate::types::{AppendOnlyFile, DataFile, SizeEntry, SizeInfo};
 use croaring::Bitmap;
+use std::convert::TryInto;
 use std::path::{Path, PathBuf};
 
 const PMMR_HASH_FILE: &str = "pmmr_hash.bin";
@@ -65,17 +66,15 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 	/// Append the provided data and hashes to the backend storage.
 	/// Add the new leaf pos to our leaf_set if this is a prunable MMR.
 	#[allow(unused_variables)]
-	fn append(&mut self, data: &T, hashes: Vec<Hash>) -> Result<(), String> {
+	fn append(&mut self, data: &T, hashes: &[Hash]) -> Result<(), String> {
 		let size = self
 			.data_file
 			.append(&data.as_elmt())
 			.map_err(|e| format!("Failed to append data to file. {}", e))?;
 
-		for h in &hashes {
-			self.hash_file
-				.append(h)
-				.map_err(|e| format!("Failed to append hash to file. {}", e))?;
-		}
+		self.hash_file
+			.extend_from_slice(hashes)
+			.map_err(|e| format!("Failed to append hash to file. {}", e))?;
 
 		if self.prunable {
 			// (Re)calculate the latest pos given updated size of data file
@@ -95,6 +94,11 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 		self.hash_file.read(position - shift)
 	}
 
+	fn get_peak_from_file(&self, position: u64) -> Option<Hash> {
+		let shift = self.prune_list.get_shift(position);
+		self.hash_file.read(position - shift)
+	}
+
 	fn get_data_from_file(&self, position: u64) -> Option<T::E> {
 		if !pmmr::is_leaf(position) {
 			return None;
@@ -110,7 +114,7 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 	/// Get the hash at pos.
 	/// Return None if pos is a leaf and it has been removed (or pruned or
 	/// compacted).
-	fn get_hash(&self, pos: u64) -> Option<(Hash)> {
+	fn get_hash(&self, pos: u64) -> Option<Hash> {
 		if self.prunable && pmmr::is_leaf(pos) && !self.leaf_set.includes(pos) {
 			return None;
 		}
@@ -119,7 +123,7 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 
 	/// Get the data at pos.
 	/// Return None if it has been removed or if pos is not a leaf node.
-	fn get_data(&self, pos: u64) -> Option<(T::E)> {
+	fn get_data(&self, pos: u64) -> Option<T::E> {
 		if !pmmr::is_leaf(pos) {
 			return None;
 		}
@@ -132,7 +136,7 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 	/// Returns an iterator over all the leaf positions.
 	/// for a prunable PMMR this is an iterator over the leaf_set bitmap.
 	/// For a non-prunable PMMR this is *all* leaves (this is not yet implemented).
-	fn leaf_pos_iter(&self) -> Box<Iterator<Item = u64> + '_> {
+	fn leaf_pos_iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
 		if self.prunable {
 			Box::new(self.leaf_set.iter())
 		} else {
@@ -140,10 +144,34 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 		}
 	}
 
-	fn data_as_temp_file(&self) -> Result<File, String> {
-		self.data_file
-			.as_temp_file()
-			.map_err(|_| format!("Failed to build temp data file"))
+	fn n_unpruned_leaves(&self) -> u64 {
+		if self.prunable {
+			self.leaf_set.len() as u64
+		} else {
+			pmmr::n_leaves(self.unpruned_size())
+		}
+	}
+
+	/// Returns an iterator over all the leaf insertion indices (0-indexed).
+	/// If our pos are [1,2,4,5,8] (first 5 leaf pos) then our insertion indices are [0,1,2,3,4]
+	fn leaf_idx_iter(&self, from_idx: u64) -> Box<dyn Iterator<Item = u64> + '_> {
+		// pass from_idx in as param
+		// convert this to pos
+		// iterate, skipping everything prior to this
+		// pass in from_idx=0 then we want to convert to pos=1
+
+		let from_pos = pmmr::insertion_to_pmmr_index(from_idx + 1);
+
+		if self.prunable {
+			Box::new(
+				self.leaf_set
+					.iter()
+					.skip_while(move |x| *x < from_pos)
+					.map(|x| pmmr::n_leaves(x).saturating_sub(1)),
+			)
+		} else {
+			panic!("leaf_idx_iter not implemented for non-prunable PMMR")
+		}
 	}
 
 	/// Rewind the PMMR backend to the given position.
@@ -199,24 +227,20 @@ impl<T: PMMRable> Backend<T> for PMMRBackend<T> {
 
 impl<T: PMMRable> PMMRBackend<T> {
 	/// Instantiates a new PMMR backend.
+	/// If optional size is provided then treat as "fixed" size otherwise "variable" size backend.
 	/// Use the provided dir to store its files.
 	pub fn new<P: AsRef<Path>>(
 		data_dir: P,
 		prunable: bool,
-		fixed_size: bool,
+		version: ProtocolVersion,
 		header: Option<&BlockHeader>,
 	) -> io::Result<PMMRBackend<T>> {
-		// Note: Explicit protocol version here.
-		// Regardless of our "default" protocol version we have existing MMR files
-		// and we need to be able to support these across upgrades.
-		let version = ProtocolVersion(1);
-
 		let data_dir = data_dir.as_ref();
 
 		// Are we dealing with "fixed size" data elements or "variable size" data elements
 		// maintained in an associated size file?
-		let size_info = if fixed_size {
-			SizeInfo::FixedSize(T::E::LEN as u16)
+		let size_info = if let Some(fixed_size) = T::elmt_size() {
+			SizeInfo::FixedSize(fixed_size)
 		} else {
 			SizeInfo::VariableSize(Box::new(AppendOnlyFile::open(
 				data_dir.join(PMMR_SIZE_FILE),
@@ -226,7 +250,7 @@ impl<T: PMMRable> PMMRBackend<T> {
 		};
 
 		// Hash file is always "fixed size" and we use 32 bytes per hash.
-		let hash_size_info = SizeInfo::FixedSize(Hash::LEN as u16);
+		let hash_size_info = SizeInfo::FixedSize(Hash::LEN.try_into().unwrap());
 
 		let hash_file = DataFile::open(&data_dir.join(PMMR_HASH_FILE), hash_size_info, version)?;
 		let data_file = DataFile::open(&data_dir.join(PMMR_DATA_FILE), size_info, version)?;
@@ -265,8 +289,15 @@ impl<T: PMMRable> PMMRBackend<T> {
 		self.prune_list.is_pruned_root(pos)
 	}
 
+	// Check if pos is pruned but not a pruned root itself.
+	// Checking for pruned root is faster so we do this check first.
+	// We can do a fast initial check as well -
+	// if its in the current leaf_set then we know it is not compacted.
 	fn is_compacted(&self, pos: u64) -> bool {
-		self.is_pruned(pos) && !self.is_pruned_root(pos)
+		if self.leaf_set.includes(pos) {
+			return false;
+		}
+		!self.is_pruned_root(pos) && self.is_pruned(pos)
 	}
 
 	/// Number of hashes in the PMMR stored by this backend. Only produces the
@@ -333,17 +364,17 @@ impl<T: PMMRable> PMMRBackend<T> {
 		// on the cutoff_pos provided.
 		let (leaves_removed, pos_to_rm) = self.pos_to_rm(cutoff_pos, rewind_rm_pos);
 
-		// 1. Save compact copy of the hash file, skipping removed data.
+		// Save compact copy of the hash file, skipping removed data.
 		{
 			let pos_to_rm = map_vec!(pos_to_rm, |pos| {
 				let shift = self.prune_list.get_shift(pos.into());
 				pos as u64 - shift
 			});
 
-			self.hash_file.save_prune(&pos_to_rm)?;
+			self.hash_file.write_tmp_pruned(&pos_to_rm)?;
 		}
 
-		// 2. Save compact copy of the data file, skipping removed leaves.
+		// Save compact copy of the data file, skipping removed leaves.
 		{
 			let leaf_pos_to_rm = pos_to_rm
 				.iter()
@@ -357,10 +388,19 @@ impl<T: PMMRable> PMMRBackend<T> {
 				flat_pos - shift
 			});
 
-			self.data_file.save_prune(&pos_to_rm)?;
+			self.data_file.write_tmp_pruned(&pos_to_rm)?;
 		}
 
-		// 3. Update the prune list and write to disk.
+		// Replace hash and data files with compact copies.
+		// Rebuild and intialize from the new files.
+		{
+			debug!("compact: about to replace hash and data files and rebuild...");
+			self.hash_file.replace_with_tmp()?;
+			self.data_file.replace_with_tmp()?;
+			debug!("compact: ...finished replacing and rebuilding");
+		}
+
+		// Update the prune list and write to disk.
 		{
 			for pos in leaves_removed.iter() {
 				self.prune_list.add(pos.into());
@@ -368,11 +408,10 @@ impl<T: PMMRable> PMMRBackend<T> {
 			self.prune_list.flush()?;
 		}
 
-		// 4. Write the leaf_set to disk.
+		// Write the leaf_set to disk.
 		// Optimize the bitmap storage in the process.
 		self.leaf_set.flush()?;
 
-		// 5. cleanup rewind files
 		self.clean_rewind_files()?;
 
 		Ok(true)
@@ -472,7 +511,7 @@ pub fn clean_files_by_prefix<P: AsRef<std::path::Path>>(
 
 	let number_of_files_deleted: u32 = fs::read_dir(&path)?
 		.flat_map(
-			|possible_dir_entry| -> Result<u32, Box<std::error::Error>> {
+			|possible_dir_entry| -> Result<u32, Box<dyn std::error::Error>> {
 				// result implements iterator and so if we were to use map here
 				// we would have a list of Result<u32, Box<std::error::Error>>
 				// but because we use flat_map, the errors get "discarded" and we are

@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,27 +15,29 @@
 use crate::util::{Mutex, RwLock};
 use std::fmt;
 use std::fs::File;
-use std::io::Read;
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use lru_cache::LruCache;
+
 use crate::chain;
+use crate::chain::txhashset::BitmapChunk;
 use crate::conn;
 use crate::core::core::hash::{Hash, Hashed};
+use crate::core::core::{OutputIdentifier, Segment, SegmentIdentifier, TxKernel};
 use crate::core::pow::Difficulty;
 use crate::core::ser::Writeable;
 use crate::core::{core, global};
 use crate::handshake::Handshake;
-use crate::msg::{
-	self, BanReason, GetPeerAddrs, KernelDataRequest, Locator, Ping, TxHashSetRequest, Type,
-};
+use crate::msg::{self, BanReason, GetPeerAddrs, Locator, Msg, Ping, TxHashSetRequest, Type};
 use crate::protocol::Protocol;
 use crate::types::{
 	Capabilities, ChainAdapter, Error, NetAdapter, P2PConfig, PeerAddr, PeerInfo, ReasonForBan,
 	TxHashSetRead,
 };
+use crate::util::secp::pedersen::RangeProof;
 use chrono::prelude::{DateTime, Utc};
 
 const MAX_TRACK_SIZE: usize = 30;
@@ -150,7 +152,7 @@ impl Peer {
 
 	pub fn is_denied(config: &P2PConfig, peer_addr: PeerAddr) -> bool {
 		if let Some(ref denied) = config.peers_deny {
-			if denied.contains(&peer_addr) {
+			if denied.peers.contains(&peer_addr) {
 				debug!(
 					"checking peer allowed/denied: {:?} explicitly denied",
 					peer_addr
@@ -159,7 +161,7 @@ impl Peer {
 			}
 		}
 		if let Some(ref allowed) = config.peers_allow {
-			if allowed.contains(&peer_addr) {
+			if allowed.peers.contains(&peer_addr) {
 				debug!(
 					"checking peer allowed/denied: {:?} explicitly allowed",
 					peer_addr
@@ -203,27 +205,13 @@ impl Peer {
 
 	/// Whether the peer is considered abusive, mostly for spammy nodes
 	pub fn is_abusive(&self) -> bool {
-		let rec = self.tracker.received_bytes.read();
-		let sent = self.tracker.sent_bytes.read();
-		rec.count_per_min() > MAX_PEER_MSG_PER_MIN || sent.count_per_min() > MAX_PEER_MSG_PER_MIN
+		let rec = self.tracker().received_bytes.read();
+		rec.count_per_min() > MAX_PEER_MSG_PER_MIN
 	}
 
-	/// Number of bytes sent to the peer
-	pub fn last_min_sent_bytes(&self) -> Option<u64> {
-		let sent_bytes = self.tracker.sent_bytes.read();
-		Some(sent_bytes.bytes_per_min())
-	}
-
-	/// Number of bytes received from the peer
-	pub fn last_min_received_bytes(&self) -> Option<u64> {
-		let received_bytes = self.tracker.received_bytes.read();
-		Some(received_bytes.bytes_per_min())
-	}
-
-	pub fn last_min_message_counts(&self) -> Option<(u64, u64)> {
-		let received_bytes = self.tracker.received_bytes.read();
-		let sent_bytes = self.tracker.sent_bytes.read();
-		Some((sent_bytes.count_per_min(), received_bytes.count_per_min()))
+	/// Tracker tracks sent/received bytes and message counts per minute.
+	pub fn tracker(&self) -> &conn::Tracker {
+		&self.tracker
 	}
 
 	/// Set this peer status to banned
@@ -233,12 +221,8 @@ impl Peer {
 
 	/// Send a msg with given msg_type to our peer via the connection.
 	fn send<T: Writeable>(&self, msg: T, msg_type: Type) -> Result<(), Error> {
-		let bytes = self
-			.send_handle
-			.lock()
-			.send(msg, msg_type, self.info.version)?;
-		self.tracker.inc_sent(bytes);
-		Ok(())
+		let msg = Msg::new(msg_type, msg, self.info.version)?;
+		self.send_handle.lock().send(msg)
 	}
 
 	/// Send a ping to the remote peer, providing our local difficulty and
@@ -255,23 +239,6 @@ impl Peer {
 	pub fn send_ban_reason(&self, ban_reason: ReasonForBan) -> Result<(), Error> {
 		let ban_reason_msg = BanReason { ban_reason };
 		self.send(ban_reason_msg, msg::Type::BanReason).map(|_| ())
-	}
-
-	/// Sends the provided block to the remote peer. The request may be dropped
-	/// if the remote peer is known to already have the block.
-	pub fn send_block(&self, b: &core::Block) -> Result<bool, Error> {
-		if !self.tracking_adapter.has_recv(b.hash()) {
-			trace!("Send block {} to {}", b.hash(), self.info.addr);
-			self.send(b, msg::Type::Block)?;
-			Ok(true)
-		} else {
-			debug!(
-				"Suppress block send {} to {} (already seen)",
-				b.hash(),
-				self.info.addr,
-			);
-			Ok(false)
-		}
 	}
 
 	pub fn send_compact_block(&self, b: &core::CompactBlock) -> Result<bool, Error> {
@@ -368,10 +335,11 @@ impl Peer {
 		self.send(&h, msg::Type::GetTransaction)
 	}
 
-	/// Sends a request for a specific block by hash
-	pub fn send_block_request(&self, h: Hash) -> Result<(), Error> {
+	/// Sends a request for a specific block by hash.
+	/// Takes opts so we can track if this request was due to our node syncing or otherwise.
+	pub fn send_block_request(&self, h: Hash, opts: chain::Options) -> Result<(), Error> {
 		debug!("Requesting block {} from peer {}.", h, self.info.addr);
-		self.tracking_adapter.push_req(h);
+		self.tracking_adapter.push_req(h, opts);
 		self.send(&h, msg::Type::GetBlock)
 	}
 
@@ -403,11 +371,6 @@ impl Peer {
 		)
 	}
 
-	pub fn send_kernel_data_request(&self) -> Result<(), Error> {
-		debug!("Asking {} for kernel data.", self.info.addr);
-		self.send(&KernelDataRequest {}, msg::Type::KernelDataRequest)
-	}
-
 	/// Stops the peer
 	pub fn stop(&self) {
 		debug!("Stopping peer {:?}", self.info.addr);
@@ -433,51 +396,35 @@ impl Peer {
 #[derive(Clone)]
 struct TrackingAdapter {
 	adapter: Arc<dyn NetAdapter>,
-	known: Arc<RwLock<Vec<Hash>>>,
-	requested: Arc<RwLock<Vec<Hash>>>,
+	received: Arc<RwLock<LruCache<Hash, ()>>>,
+	requested: Arc<RwLock<LruCache<Hash, chain::Options>>>,
 }
 
 impl TrackingAdapter {
 	fn new(adapter: Arc<dyn NetAdapter>) -> TrackingAdapter {
 		TrackingAdapter {
 			adapter: adapter,
-			known: Arc::new(RwLock::new(Vec::with_capacity(MAX_TRACK_SIZE))),
-			requested: Arc::new(RwLock::new(Vec::with_capacity(MAX_TRACK_SIZE))),
+			received: Arc::new(RwLock::new(LruCache::new(MAX_TRACK_SIZE))),
+			requested: Arc::new(RwLock::new(LruCache::new(MAX_TRACK_SIZE))),
 		}
 	}
 
 	fn has_recv(&self, hash: Hash) -> bool {
-		let known = self.known.read();
-		// may become too slow, an ordered set (by timestamp for eviction) may
-		// end up being a better choice
-		known.contains(&hash)
+		self.received.write().contains_key(&hash)
 	}
 
 	fn push_recv(&self, hash: Hash) {
-		let mut known = self.known.write();
-		if known.len() > MAX_TRACK_SIZE {
-			known.truncate(MAX_TRACK_SIZE);
-		}
-		if !known.contains(&hash) {
-			known.insert(0, hash);
-		}
+		self.received.write().insert(hash, ());
 	}
 
-	fn has_req(&self, hash: Hash) -> bool {
-		let requested = self.requested.read();
-		// may become too slow, an ordered set (by timestamp for eviction) may
-		// end up being a better choice
-		requested.contains(&hash)
+	/// Track a block or transaction hash requested by us.
+	/// Track the opts alongside the hash so we know if this was due to us syncing or not.
+	fn push_req(&self, hash: Hash, opts: chain::Options) {
+		self.requested.write().insert(hash, opts);
 	}
 
-	fn push_req(&self, hash: Hash) {
-		let mut requested = self.requested.write();
-		if requested.len() > MAX_TRACK_SIZE {
-			requested.truncate(MAX_TRACK_SIZE);
-		}
-		if !requested.contains(&hash) {
-			requested.insert(0, hash);
-		}
+	fn req_opts(&self, hash: Hash) -> Option<chain::Options> {
+		self.requested.write().get_mut(&hash).cloned()
 	}
 }
 
@@ -522,11 +469,17 @@ impl ChainAdapter for TrackingAdapter {
 		&self,
 		b: core::Block,
 		peer_info: &PeerInfo,
-		_was_requested: bool,
+		opts: chain::Options,
 	) -> Result<bool, chain::Error> {
 		let bh = b.hash();
 		self.push_recv(bh);
-		self.adapter.block_received(b, peer_info, self.has_req(bh))
+
+		// If we are currently tracking a request for this block then
+		// use the opts specified when we made the request.
+		// If we requested this block as part of sync then we want to
+		// let our adapter know this when we receive it.
+		let req_opts = self.req_opts(bh).unwrap_or(opts);
+		self.adapter.block_received(b, peer_info, req_opts)
 	}
 
 	fn compact_block_received(
@@ -559,16 +512,8 @@ impl ChainAdapter for TrackingAdapter {
 		self.adapter.locate_headers(locator)
 	}
 
-	fn get_block(&self, h: Hash) -> Option<core::Block> {
-		self.adapter.get_block(h)
-	}
-
-	fn kernel_data_read(&self) -> Result<File, chain::Error> {
-		self.adapter.kernel_data_read()
-	}
-
-	fn kernel_data_write(&self, reader: &mut Read) -> Result<bool, chain::Error> {
-		self.adapter.kernel_data_write(reader)
+	fn get_block(&self, h: Hash, peer_info: &PeerInfo) -> Option<core::Block> {
+		self.adapter.get_block(h, peer_info)
 	}
 
 	fn txhashset_read(&self, h: Hash) -> Option<TxHashSetRead> {
@@ -608,6 +553,38 @@ impl ChainAdapter for TrackingAdapter {
 
 	fn get_tmpfile_pathname(&self, tmpfile_name: String) -> PathBuf {
 		self.adapter.get_tmpfile_pathname(tmpfile_name)
+	}
+
+	fn get_kernel_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<Segment<TxKernel>, chain::Error> {
+		self.adapter.get_kernel_segment(hash, id)
+	}
+
+	fn get_bitmap_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<(Segment<BitmapChunk>, Hash), chain::Error> {
+		self.adapter.get_bitmap_segment(hash, id)
+	}
+
+	fn get_output_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<(Segment<OutputIdentifier>, Hash), chain::Error> {
+		self.adapter.get_output_segment(hash, id)
+	}
+
+	fn get_rangeproof_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<Segment<RangeProof>, chain::Error> {
+		self.adapter.get_rangeproof_segment(hash, id)
 	}
 }
 

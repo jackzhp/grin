@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::marker;
-use std::u64;
+use std::{marker, ops::Range, u64};
 
 use croaring::Bitmap;
 
@@ -25,6 +24,142 @@ use crate::ser::{PMMRIndexHashable, PMMRable};
 
 /// 64 bits all ones: 0b11111111...1
 const ALL_ONES: u64 = u64::MAX;
+
+/// Trait with common methods for reading from a PMMR
+pub trait ReadablePMMR {
+	/// Leaf type
+	type Item;
+
+	/// Get the hash at provided position in the MMR.
+	fn get_hash(&self, pos: u64) -> Option<Hash>;
+
+	/// Get the data element at provided position in the MMR.
+	fn get_data(&self, pos: u64) -> Option<Self::Item>;
+
+	/// Get the hash from the underlying MMR file (ignores the remove log).
+	fn get_from_file(&self, pos: u64) -> Option<Hash>;
+
+	/// Get the hash for the provided peak pos.
+	/// Optimized for reading peak hashes rather than arbitrary pos hashes.
+	/// Peaks can be assumed to not be compacted.
+	fn get_peak_from_file(&self, pos: u64) -> Option<Hash>;
+
+	/// Get the data element at provided position in the MMR (ignores the remove log).
+	fn get_data_from_file(&self, pos: u64) -> Option<Self::Item>;
+
+	/// Total size of the tree, including intermediary nodes and ignoring any pruning.
+	fn unpruned_size(&self) -> u64;
+
+	/// Iterator over current (unpruned, unremoved) leaf positions.
+	fn leaf_pos_iter(&self) -> Box<dyn Iterator<Item = u64> + '_>;
+
+	/// Iterator over current (unpruned, unremoved) leaf insertion indices.
+	fn leaf_idx_iter(&self, from_idx: u64) -> Box<dyn Iterator<Item = u64> + '_>;
+
+	/// Number of leaves in the MMR
+	fn n_unpruned_leaves(&self) -> u64;
+
+	/// Is the MMR empty?
+	fn is_empty(&self) -> bool {
+		self.unpruned_size() == 0
+	}
+
+	/// Takes a single peak position and hashes together
+	/// all the peaks to the right of this peak (if any).
+	/// If this return a hash then this is our peaks sibling.
+	/// If none then the sibling of our peak is the peak to the left.
+	fn bag_the_rhs(&self, peak_pos: u64) -> Option<Hash> {
+		let last_pos = self.unpruned_size();
+		let rhs = peaks(last_pos)
+			.into_iter()
+			.filter(|&x| x > peak_pos)
+			.filter_map(|x| self.get_from_file(x));
+
+		let mut res = None;
+		for peak in rhs.rev() {
+			res = match res {
+				None => Some(peak),
+				Some(rhash) => Some((peak, rhash).hash_with_index(last_pos)),
+			}
+		}
+		res
+	}
+
+	/// Returns a vec of the peaks of this MMR.
+	fn peaks(&self) -> Vec<Hash> {
+		peaks(self.unpruned_size())
+			.into_iter()
+			.filter_map(move |pi| self.get_peak_from_file(pi))
+			.collect()
+	}
+
+	/// Hashes of the peaks excluding `peak_pos`, where the rhs is bagged together
+	fn peak_path(&self, peak_pos: u64) -> Vec<Hash> {
+		let rhs = self.bag_the_rhs(peak_pos);
+		let mut res = peaks(self.unpruned_size())
+			.into_iter()
+			.filter(|&x| x < peak_pos)
+			.filter_map(|x| self.get_peak_from_file(x))
+			.collect::<Vec<_>>();
+		if let Some(rhs) = rhs {
+			res.push(rhs);
+		}
+		res.reverse();
+
+		res
+	}
+
+	/// Computes the root of the MMR. Find all the peaks in the current
+	/// tree and "bags" them to get a single peak.
+	fn root(&self) -> Result<Hash, String> {
+		if self.is_empty() {
+			return Ok(ZERO_HASH);
+		}
+		let mut res = None;
+		let peaks = self.peaks();
+		for peak in peaks.into_iter().rev() {
+			res = match res {
+				None => Some(peak),
+				Some(rhash) => Some((peak, rhash).hash_with_index(self.unpruned_size())),
+			}
+		}
+		res.ok_or_else(|| "no root, invalid tree".to_owned())
+	}
+
+	/// Build a Merkle proof for the element at the given position.
+	fn merkle_proof(&self, pos: u64) -> Result<MerkleProof, String> {
+		let last_pos = self.unpruned_size();
+		debug!("merkle_proof  {}, last_pos {}", pos, last_pos);
+
+		// check this pos is actually a leaf in the MMR
+		if !is_leaf(pos) {
+			return Err(format!("not a leaf at pos {}", pos));
+		}
+
+		// check we actually have a hash in the MMR at this pos
+		self.get_hash(pos)
+			.ok_or_else(|| format!("no element at pos {}", pos))?;
+
+		let family_branch = family_branch(pos, last_pos);
+
+		let mut path = family_branch
+			.iter()
+			.filter_map(|x| self.get_from_file(x.1))
+			.collect::<Vec<_>>();
+
+		let peak_pos = match family_branch.last() {
+			Some(&(x, _)) => x,
+			None => pos,
+		};
+
+		path.append(&mut self.peak_path(peak_pos));
+
+		Ok(MerkleProof {
+			mmr_size: last_pos,
+			path,
+		})
+	}
+}
 
 /// Prunable Merkle Mountain Range implementation. All positions within the tree
 /// start at 1 as they're postorder tree traversal positions rather than array
@@ -74,107 +209,6 @@ where
 		ReadonlyPMMR::at(&self.backend, self.last_pos)
 	}
 
-	/// Iterator over current (unpruned, unremoved) leaf positions.
-	pub fn leaf_pos_iter(&self) -> impl Iterator<Item = u64> + '_ {
-		self.backend.leaf_pos_iter()
-	}
-
-	/// Returns a vec of the peaks of this MMR.
-	pub fn peaks(&self) -> Vec<Hash> {
-		let peaks_pos = peaks(self.last_pos);
-		peaks_pos
-			.into_iter()
-			.filter_map(|pi| {
-				// here we want to get from underlying hash file
-				// as the pos *may* have been "removed"
-				self.backend.get_from_file(pi)
-			})
-			.collect()
-	}
-
-	fn peak_path(&self, peak_pos: u64) -> Vec<Hash> {
-		let rhs = self.bag_the_rhs(peak_pos);
-		let mut res = peaks(self.last_pos)
-			.into_iter()
-			.filter(|x| *x < peak_pos)
-			.filter_map(|x| self.backend.get_from_file(x))
-			.collect::<Vec<_>>();
-		res.reverse();
-		if let Some(rhs) = rhs {
-			res.insert(0, rhs);
-		}
-		res
-	}
-
-	/// Takes a single peak position and hashes together
-	/// all the peaks to the right of this peak (if any).
-	/// If this return a hash then this is our peaks sibling.
-	/// If none then the sibling of our peak is the peak to the left.
-	pub fn bag_the_rhs(&self, peak_pos: u64) -> Option<Hash> {
-		let rhs = peaks(self.last_pos)
-			.into_iter()
-			.filter(|x| *x > peak_pos)
-			.filter_map(|x| self.backend.get_from_file(x))
-			.collect::<Vec<_>>();
-
-		let mut res = None;
-		for peak in rhs.iter().rev() {
-			res = match res {
-				None => Some(*peak),
-				Some(rhash) => Some((*peak, rhash).hash_with_index(self.unpruned_size())),
-			}
-		}
-		res
-	}
-
-	/// Computes the root of the MMR. Find all the peaks in the current
-	/// tree and "bags" them to get a single peak.
-	pub fn root(&self) -> Result<Hash, String> {
-		if self.is_empty() {
-			return Ok(ZERO_HASH);
-		}
-		let mut res = None;
-		for peak in self.peaks().iter().rev() {
-			res = match res {
-				None => Some(*peak),
-				Some(rhash) => Some((*peak, rhash).hash_with_index(self.unpruned_size())),
-			}
-		}
-		res.ok_or_else(|| "no root, invalid tree".to_owned())
-	}
-
-	/// Build a Merkle proof for the element at the given position.
-	pub fn merkle_proof(&self, pos: u64) -> Result<MerkleProof, String> {
-		debug!("merkle_proof  {}, last_pos {}", pos, self.last_pos);
-
-		// check this pos is actually a leaf in the MMR
-		if !is_leaf(pos) {
-			return Err(format!("not a leaf at pos {}", pos));
-		}
-
-		// check we actually have a hash in the MMR at this pos
-		self.get_hash(pos)
-			.ok_or_else(|| format!("no element at pos {}", pos))?;
-
-		let mmr_size = self.unpruned_size();
-
-		let family_branch = family_branch(pos, self.last_pos);
-
-		let mut path = family_branch
-			.iter()
-			.filter_map(|x| self.get_from_file(x.1))
-			.collect::<Vec<_>>();
-
-		let peak_pos = match family_branch.last() {
-			Some(&(x, _)) => x,
-			None => pos,
-		};
-
-		path.append(&mut self.peak_path(peak_pos));
-
-		Ok(MerkleProof { mmr_size, path })
-	}
-
 	/// Push a new element into the MMR. Computes new related peaks at
 	/// the same time if applicable.
 	pub fn push(&mut self, elmt: &T) -> Result<u64, String> {
@@ -194,7 +228,7 @@ where
 			let left_sibling = pos + 1 - 2 * peak;
 			let left_hash = self
 				.backend
-				.get_from_file(left_sibling)
+				.get_peak_from_file(left_sibling)
 				.ok_or("missing left sibling in tree, should not have been pruned")?;
 			peak *= 2;
 			pos += 1;
@@ -203,7 +237,7 @@ where
 		}
 
 		// append all the new nodes and update the MMR index
-		self.backend.append(elmt, hashes)?;
+		self.backend.append(elmt, &hashes)?;
 		self.last_pos = pos;
 		Ok(elmt_pos)
 	}
@@ -213,13 +247,6 @@ where
 	/// sending the txhashset zip file to another node for fast-sync.
 	pub fn snapshot(&mut self, header: &BlockHeader) -> Result<(), String> {
 		self.backend.snapshot(header)?;
-		Ok(())
-	}
-
-	/// Truncate the MMR by rewinding back to empty state.
-	pub fn truncate(&mut self) -> Result<(), String> {
-		self.backend.rewind(0, &Bitmap::create())?;
-		self.last_pos = 0;
 		Ok(())
 	}
 
@@ -258,43 +285,6 @@ where
 		Ok(true)
 	}
 
-	/// Get the hash at provided position in the MMR.
-	pub fn get_hash(&self, pos: u64) -> Option<Hash> {
-		if pos > self.last_pos {
-			None
-		} else if is_leaf(pos) {
-			// If we are a leaf then get hash from the backend.
-			self.backend.get_hash(pos)
-		} else {
-			// If we are not a leaf get hash ignoring the remove log.
-			self.backend.get_from_file(pos)
-		}
-	}
-
-	/// Get the data element at provided position in the MMR.
-	pub fn get_data(&self, pos: u64) -> Option<T::E> {
-		if pos > self.last_pos {
-			// If we are beyond the rhs of the MMR return None.
-			None
-		} else if is_leaf(pos) {
-			// If we are a leaf then get data from the backend.
-			self.backend.get_data(pos)
-		} else {
-			// If we are not a leaf then return None as only leaves have data.
-			None
-		}
-	}
-
-	/// Get the hash from the underlying MMR file
-	/// (ignores the remove log).
-	fn get_from_file(&self, pos: u64) -> Option<Hash> {
-		if pos > self.last_pos {
-			None
-		} else {
-			self.backend.get_from_file(pos)
-		}
-	}
-
 	/// Walks all unpruned nodes in the MMR and revalidate all parent hashes
 	pub fn validate(&self) -> Result<(), String> {
 		// iterate on all parent nodes
@@ -321,17 +311,6 @@ where
 			}
 		}
 		Ok(())
-	}
-
-	/// Is the MMR empty?
-	pub fn is_empty(&self) -> bool {
-		self.last_pos == 0
-	}
-
-	/// Total size of the tree, including intermediary nodes and ignoring any
-	/// pruning.
-	pub fn unpruned_size(&self) -> u64 {
-		self.last_pos
 	}
 
 	/// Debugging utility to print information about the MMRs. Short version
@@ -396,6 +375,79 @@ where
 	}
 }
 
+impl<'a, T, B> ReadablePMMR for PMMR<'a, T, B>
+where
+	T: PMMRable,
+	B: 'a + Backend<T>,
+{
+	type Item = T::E;
+
+	fn get_hash(&self, pos: u64) -> Option<Hash> {
+		if pos > self.last_pos {
+			None
+		} else if is_leaf(pos) {
+			// If we are a leaf then get hash from the backend.
+			self.backend.get_hash(pos)
+		} else {
+			// If we are not a leaf get hash ignoring the remove log.
+			self.backend.get_from_file(pos)
+		}
+	}
+
+	fn get_data(&self, pos: u64) -> Option<Self::Item> {
+		if pos > self.last_pos {
+			// If we are beyond the rhs of the MMR return None.
+			None
+		} else if is_leaf(pos) {
+			// If we are a leaf then get data from the backend.
+			self.backend.get_data(pos)
+		} else {
+			// If we are not a leaf then return None as only leaves have data.
+			None
+		}
+	}
+
+	fn get_from_file(&self, pos: u64) -> Option<Hash> {
+		if pos > self.last_pos {
+			None
+		} else {
+			self.backend.get_from_file(pos)
+		}
+	}
+
+	fn get_peak_from_file(&self, pos: u64) -> Option<Hash> {
+		if pos > self.last_pos {
+			None
+		} else {
+			self.backend.get_peak_from_file(pos)
+		}
+	}
+
+	fn get_data_from_file(&self, pos: u64) -> Option<Self::Item> {
+		if pos > self.last_pos {
+			None
+		} else {
+			self.backend.get_data_from_file(pos)
+		}
+	}
+
+	fn unpruned_size(&self) -> u64 {
+		self.last_pos
+	}
+
+	fn leaf_pos_iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+		self.backend.leaf_pos_iter()
+	}
+
+	fn leaf_idx_iter(&self, from_idx: u64) -> Box<dyn Iterator<Item = u64> + '_> {
+		self.backend.leaf_idx_iter(from_idx)
+	}
+
+	fn n_unpruned_leaves(&self) -> u64 {
+		self.backend.n_unpruned_leaves()
+	}
+}
+
 /// Gets the postorder traversal index of all peaks in a MMR given its size.
 /// Starts with the top peak, which is always on the left
 /// side of the range, and navigates toward lower siblings toward the right
@@ -425,7 +477,7 @@ pub fn peaks(num: u64) -> Vec<u64> {
 /// The number of leaves in a MMR of the provided size.
 pub fn n_leaves(size: u64) -> u64 {
 	let (sizes, height) = peak_sizes_height(size);
-	let nleaves = sizes.iter().map(|n| (n + 1) / 2 as u64).sum();
+	let nleaves = sizes.into_iter().map(|n| (n + 1) / 2 as u64).sum();
 	if height == 0 {
 		nleaves
 	} else {
@@ -496,12 +548,19 @@ pub fn peak_map_height(mut pos: u64) -> (u64, u64) {
 /// The height of a node in a full binary tree from its postorder traversal
 /// index. This function is the base on which all others, as well as the MMR,
 /// are built.
-
 pub fn bintree_postorder_height(num: u64) -> u64 {
-	if num == 0 {
+	let mut pos = num.saturating_sub(1);
+	if pos == 0 {
 		return 0;
 	}
-	peak_map_height(num - 1).1
+	let mut peak_size = ALL_ONES >> pos.leading_zeros();
+	while peak_size != 0 {
+		if pos >= peak_size {
+			pos -= peak_size;
+		}
+		peak_size >>= 1;
+	}
+	pos
 }
 
 /// Is this position a leaf in the MMR?
@@ -535,17 +594,46 @@ pub fn is_left_sibling(pos: u64) -> bool {
 /// corresponding peak in the MMR.
 /// The size (and therefore the set of peaks) of the MMR
 /// is defined by last_pos.
-pub fn path(pos: u64, last_pos: u64) -> Vec<u64> {
-	let (peak_map, height) = peak_map_height(pos - 1);
-	let mut peak = 1 << height;
-	let mut path = vec![];
-	let mut current = pos;
-	while current <= last_pos {
-		path.push(current);
-		current += if (peak_map & peak) != 0 { 1 } else { 2 * peak };
-		peak <<= 1;
+pub fn path(pos: u64, last_pos: u64) -> impl Iterator<Item = u64> {
+	Path::new(pos, last_pos)
+}
+
+struct Path {
+	current: u64,
+	last_pos: u64,
+	peak: u64,
+	peak_map: u64,
+}
+
+impl Path {
+	fn new(pos: u64, last_pos: u64) -> Self {
+		let (peak_map, height) = peak_map_height(pos - 1);
+		Path {
+			current: pos,
+			peak: 1 << height,
+			peak_map,
+			last_pos,
+		}
 	}
-	path
+}
+
+impl Iterator for Path {
+	type Item = u64;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.current > self.last_pos {
+			return None;
+		}
+
+		let next = Some(self.current);
+		self.current += if (self.peak_map & self.peak) != 0 {
+			1
+		} else {
+			2 * self.peak
+		};
+		self.peak <<= 1;
+		next
+	}
 }
 
 /// For a given starting position calculate the parent and sibling positions
@@ -585,4 +673,11 @@ pub fn bintree_rightmost(num: u64) -> u64 {
 pub fn bintree_leftmost(num: u64) -> u64 {
 	let height = bintree_postorder_height(num);
 	num + 2 - (2 << height)
+}
+
+/// All pos in the subtree beneath the provided root, including root itself.
+pub fn bintree_range(num: u64) -> Range<u64> {
+	let height = bintree_postorder_height(num);
+	let leftmost = num + 2 - (2 << height);
+	leftmost..(num + 1)
 }

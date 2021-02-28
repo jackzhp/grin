@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +28,11 @@
 #![deny(unused_mut)]
 #![warn(missing_docs)]
 
+pub use self::common::EdgeType;
+pub use self::types::*;
+use crate::core::{Block, BlockHeader};
+use crate::genesis;
+use crate::global;
 use chrono;
 use num;
 
@@ -35,6 +40,8 @@ use num;
 mod common;
 pub mod cuckaroo;
 pub mod cuckarood;
+pub mod cuckaroom;
+pub mod cuckarooz;
 pub mod cuckatoo;
 mod error;
 #[allow(dead_code)]
@@ -42,17 +49,13 @@ pub mod lean;
 mod siphash;
 mod types;
 
-use crate::core::{Block, BlockHeader};
-use crate::genesis;
-use crate::global;
-use chrono::prelude::{DateTime, NaiveDateTime, Utc};
-
-pub use self::common::EdgeType;
-pub use self::types::*;
-pub use crate::pow::cuckaroo::{new_cuckaroo_ctx, CuckarooContext};
+pub use crate::pow::cuckaroo::{new_cuckaroo_ctx, no_cuckaroo_ctx, CuckarooContext};
 pub use crate::pow::cuckarood::{new_cuckarood_ctx, CuckaroodContext};
+pub use crate::pow::cuckaroom::{new_cuckaroom_ctx, CuckaroomContext};
+pub use crate::pow::cuckarooz::{new_cuckarooz_ctx, CuckaroozContext};
 pub use crate::pow::cuckatoo::{new_cuckatoo_ctx, CuckatooContext};
 pub use crate::pow::error::Error;
+use chrono::prelude::{DateTime, NaiveDateTime, Utc};
 
 const MAX_SOLS: u32 = 10;
 
@@ -129,7 +132,7 @@ mod test {
 	/// We'll be generating genesis blocks differently
 	#[test]
 	fn genesis_pow() {
-		global::set_mining_mode(ChainTypes::UserTesting);
+		global::set_local_chain_type(ChainTypes::UserTesting);
 
 		let mut b = genesis::genesis_dev();
 		b.header.pow.nonce = 28106;
@@ -137,14 +140,14 @@ mod test {
 		println!("proof {}", global::proofsize());
 		pow_size(
 			&mut b.header,
-			Difficulty::min(),
+			Difficulty::min_dma(),
 			global::proofsize(),
 			global::min_edge_bits(),
 		)
 		.unwrap();
 		println!("nonce {}", b.header.pow.nonce);
 		assert_ne!(b.header.pow.nonce, 310);
-		assert!(b.header.pow.to_difficulty(0) >= Difficulty::min());
+		assert!(b.header.pow.to_difficulty(0) >= Difficulty::min_dma());
 		assert!(verify_size(&b.header).is_ok());
 	}
 }

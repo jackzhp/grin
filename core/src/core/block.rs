@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,27 +14,30 @@
 
 //! Blocks and blockheaders
 
-use crate::util::RwLock;
-use chrono::naive::{MAX_DATE, MIN_DATE};
-use chrono::prelude::{DateTime, NaiveDateTime, Utc};
-use std::collections::HashSet;
-use std::fmt;
-use std::iter::FromIterator;
-use std::sync::Arc;
-
 use crate::consensus::{self, reward, REWARD};
 use crate::core::committed::{self, Committed};
-use crate::core::compact_block::{CompactBlock, CompactBlockBody};
+use crate::core::compact_block::CompactBlock;
 use crate::core::hash::{DefaultHashable, Hash, Hashed, ZERO_HASH};
 use crate::core::verifier_cache::VerifierCache;
 use crate::core::{
-	transaction, Commitment, Input, Output, Transaction, TransactionBody, TxKernel, Weighting,
+	pmmr, transaction, Commitment, Inputs, KernelFeatures, Output, Transaction, TransactionBody,
+	TxKernel, Weighting,
 };
 use crate::global;
-use crate::keychain::{self, BlindingFactor};
-use crate::pow::{Difficulty, Proof, ProofOfWork};
-use crate::ser::{self, FixedLength, PMMRable, Readable, Reader, Writeable, Writer};
-use crate::util::{secp, static_secp_instance};
+use crate::pow::{verify_size, Difficulty, Proof, ProofOfWork};
+use crate::ser::{
+	self, deserialize_default, serialize_default, PMMRable, Readable, Reader, Writeable, Writer,
+};
+use chrono::naive::{MAX_DATE, MIN_DATE};
+use chrono::prelude::{DateTime, NaiveDateTime, Utc};
+use chrono::Duration;
+use keychain::{self, BlindingFactor};
+use std::convert::TryInto;
+use std::fmt;
+use std::sync::Arc;
+use util::from_hex;
+use util::RwLock;
+use util::{secp, static_secp_instance};
 
 /// Errors thrown by Block validation
 #[derive(Debug, Clone, Eq, PartialEq, Fail)]
@@ -48,10 +51,18 @@ pub enum Error {
 	CoinbaseSumMismatch,
 	/// Restrict block total weight.
 	TooHeavy,
-	/// Block weight (based on inputs|outputs|kernels) exceeded.
-	WeightExceeded,
+	/// Block version is invalid for a given block height
+	InvalidBlockVersion(HeaderVersion),
+	/// Block time is invalid
+	InvalidBlockTime,
+	/// Invalid POW
+	InvalidPow,
 	/// Kernel not valid due to lock_height exceeding block header height
 	KernelLockHeight(u64),
+	/// NRD kernels are not valid prior to HF3.
+	NRDKernelPreHF3,
+	/// NRD kernels are not valid if disabled locally via "feature flag".
+	NRDKernelNotEnabled,
 	/// Underlying tx related error
 	Transaction(transaction::Error),
 	/// Underlying Secp256k1 error (signature validation or invalid public key
@@ -121,7 +132,7 @@ pub struct HeaderEntry {
 }
 
 impl Readable for HeaderEntry {
-	fn read(reader: &mut Reader) -> Result<HeaderEntry, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<HeaderEntry, ser::Error> {
 		let hash = Hash::read(reader)?;
 		let timestamp = reader.read_u64()?;
 		let total_difficulty = Difficulty::read(reader)?;
@@ -157,10 +168,6 @@ impl Writeable for HeaderEntry {
 	}
 }
 
-impl FixedLength for HeaderEntry {
-	const LEN: usize = Hash::LEN + 8 + Difficulty::LEN + 4 + 1;
-}
-
 impl Hashed for HeaderEntry {
 	/// The hash of the underlying block.
 	fn hash(&self) -> Hash {
@@ -169,28 +176,8 @@ impl Hashed for HeaderEntry {
 }
 
 /// Some type safety around header versioning.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Serialize)]
 pub struct HeaderVersion(pub u16);
-
-impl Default for HeaderVersion {
-	fn default() -> HeaderVersion {
-		HeaderVersion(1)
-	}
-}
-
-// self-conscious increment function courtesy of Jasper
-impl HeaderVersion {
-	fn next(&self) -> Self {
-		Self(self.0 + 1)
-	}
-}
-
-impl HeaderVersion {
-	/// Constructor taking the provided version.
-	pub fn new(version: u16) -> HeaderVersion {
-		HeaderVersion(version)
-	}
-}
 
 impl From<HeaderVersion> for u16 {
 	fn from(v: HeaderVersion) -> u16 {
@@ -205,7 +192,7 @@ impl Writeable for HeaderVersion {
 }
 
 impl Readable for HeaderVersion {
-	fn read(reader: &mut dyn Reader) -> Result<HeaderVersion, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<HeaderVersion, ser::Error> {
 		let version = reader.read_u16()?;
 		Ok(HeaderVersion(version))
 	}
@@ -246,7 +233,7 @@ impl DefaultHashable for BlockHeader {}
 impl Default for BlockHeader {
 	fn default() -> BlockHeader {
 		BlockHeader {
-			version: HeaderVersion::default(),
+			version: HeaderVersion(1),
 			height: 0,
 			timestamp: DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc),
 			prev_hash: ZERO_HASH,
@@ -274,12 +261,18 @@ impl PMMRable for BlockHeader {
 			is_secondary: self.pow.is_secondary(),
 		}
 	}
+
+	// Size is hash + u64 + difficulty + u32 + u8.
+	fn elmt_size() -> Option<u16> {
+		const LEN: usize = Hash::LEN + 8 + Difficulty::LEN + 4 + 1;
+		Some(LEN.try_into().unwrap())
+	}
 }
 
 /// Serialization of a block header
 impl Writeable for BlockHeader {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
-		if writer.serialization_mode() != ser::SerializationMode::Hash {
+		if !writer.serialization_mode().is_hash_mode() {
 			self.write_pre_pow(writer)?;
 		}
 		self.pow.write(writer)?;
@@ -287,48 +280,44 @@ impl Writeable for BlockHeader {
 	}
 }
 
+fn read_block_header<R: Reader>(reader: &mut R) -> Result<BlockHeader, ser::Error> {
+	let version = HeaderVersion::read(reader)?;
+	let (height, timestamp) = ser_multiread!(reader, read_u64, read_i64);
+	let prev_hash = Hash::read(reader)?;
+	let prev_root = Hash::read(reader)?;
+	let output_root = Hash::read(reader)?;
+	let range_proof_root = Hash::read(reader)?;
+	let kernel_root = Hash::read(reader)?;
+	let total_kernel_offset = BlindingFactor::read(reader)?;
+	let (output_mmr_size, kernel_mmr_size) = ser_multiread!(reader, read_u64, read_u64);
+	let pow = ProofOfWork::read(reader)?;
+
+	if timestamp > MAX_DATE.and_hms(0, 0, 0).timestamp()
+		|| timestamp < MIN_DATE.and_hms(0, 0, 0).timestamp()
+	{
+		return Err(ser::Error::CorruptedData);
+	}
+
+	Ok(BlockHeader {
+		version,
+		height,
+		timestamp: DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc),
+		prev_hash,
+		prev_root,
+		output_root,
+		range_proof_root,
+		kernel_root,
+		total_kernel_offset,
+		output_mmr_size,
+		kernel_mmr_size,
+		pow,
+	})
+}
+
 /// Deserialization of a block header
 impl Readable for BlockHeader {
-	fn read(reader: &mut dyn Reader) -> Result<BlockHeader, ser::Error> {
-		let version = HeaderVersion::read(reader)?;
-		let (height, timestamp) = ser_multiread!(reader, read_u64, read_i64);
-		let prev_hash = Hash::read(reader)?;
-		let prev_root = Hash::read(reader)?;
-		let output_root = Hash::read(reader)?;
-		let range_proof_root = Hash::read(reader)?;
-		let kernel_root = Hash::read(reader)?;
-		let total_kernel_offset = BlindingFactor::read(reader)?;
-		let (output_mmr_size, kernel_mmr_size) = ser_multiread!(reader, read_u64, read_u64);
-		let pow = ProofOfWork::read(reader)?;
-
-		if timestamp > MAX_DATE.and_hms(0, 0, 0).timestamp()
-			|| timestamp < MIN_DATE.and_hms(0, 0, 0).timestamp()
-		{
-			return Err(ser::Error::CorruptedData);
-		}
-
-		// Check the block version before proceeding any further.
-		// We want to do this here because blocks can be pretty large
-		// and we want to halt processing as early as possible.
-		// If we receive an invalid block version then the peer is not on our hard-fork.
-		if !consensus::valid_header_version(height, version) {
-			return Err(ser::Error::InvalidBlockVersion);
-		}
-
-		Ok(BlockHeader {
-			version,
-			height,
-			timestamp: DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc),
-			prev_hash,
-			prev_root,
-			output_root,
-			range_proof_root,
-			kernel_root,
-			total_kernel_offset,
-			output_mmr_size,
-			kernel_mmr_size,
-			pow,
-		})
+	fn read<R: Reader>(reader: &mut R) -> Result<BlockHeader, ser::Error> {
+		read_block_header(reader)
 	}
 }
 
@@ -367,6 +356,39 @@ impl BlockHeader {
 		header_buf
 	}
 
+	/// Constructs a header given pre_pow string, nonce, and proof
+	pub fn from_pre_pow_and_proof(
+		pre_pow: String,
+		nonce: u64,
+		proof: Proof,
+	) -> Result<Self, Error> {
+		// Convert hex pre pow string
+		let mut header_bytes =
+			from_hex(&pre_pow).map_err(|e| Error::Serialization(ser::Error::HexError(e)))?;
+		// Serialize and append serialized nonce and proof
+		serialize_default(&mut header_bytes, &nonce)?;
+		serialize_default(&mut header_bytes, &proof)?;
+
+		// Deserialize header from constructed bytes
+		Ok(deserialize_default(&mut &header_bytes[..])?)
+	}
+
+	/// Total number of outputs (spent and unspent) based on output MMR size committed to in this block.
+	/// Note: *Not* the number of outputs in this block but total up to and including this block.
+	/// The MMR size is the total number of hashes contained in the full MMR structure.
+	/// We want the corresponding number of leaves in the MMR given the size.
+	pub fn output_mmr_count(&self) -> u64 {
+		pmmr::n_leaves(self.output_mmr_size)
+	}
+
+	/// Total number of kernels based on kernel MMR size committed to in this block.
+	/// Note: *Not* the number of kernels in this block but total up to and including this block.
+	/// The MMR size is the total number of hashes contained in the full MMR structure.
+	/// We want the corresponding number of leaves in the MMR given the size.
+	pub fn kernel_mmr_count(&self) -> u64 {
+		pmmr::n_leaves(self.kernel_mmr_size)
+	}
+
 	/// Total difficulty accumulated by the proof of work on this header
 	pub fn total_difficulty(&self) -> Difficulty {
 		self.pow.total_difficulty
@@ -395,7 +417,69 @@ impl BlockHeader {
 	}
 }
 
-/// A block as expressed in the MimbleWimble protocol. The reward is
+impl From<UntrustedBlockHeader> for BlockHeader {
+	fn from(header: UntrustedBlockHeader) -> Self {
+		header.0
+	}
+}
+
+/// Block header which does lightweight validation as part of deserialization,
+/// it supposed to be used when we can't trust the channel (eg network)
+#[derive(Debug)]
+pub struct UntrustedBlockHeader(BlockHeader);
+
+/// Deserialization of an untrusted block header
+impl Readable for UntrustedBlockHeader {
+	fn read<R: Reader>(reader: &mut R) -> Result<UntrustedBlockHeader, ser::Error> {
+		let header = read_block_header(reader)?;
+		let ftl = global::get_future_time_limit();
+		if header.timestamp > Utc::now() + Duration::seconds(ftl as i64) {
+			// refuse blocks whose timestamp is too far in the future
+			// this future_time_limit (FTL) is specified in grin-server.toml
+			// TODO add warning in p2p code if local time is too different from peers
+			error!(
+				"block header {} validation error: block time is more than {} seconds in the future",
+				header.hash(), ftl
+			);
+			return Err(ser::Error::CorruptedData);
+		}
+
+		// Check the block version before proceeding any further.
+		// We want to do this here because blocks can be pretty large
+		// and we want to halt processing as early as possible.
+		// If we receive an invalid block version then the peer is not on our hard-fork.
+		if !consensus::valid_header_version(header.height, header.version) {
+			return Err(ser::Error::InvalidBlockVersion);
+		}
+
+		if !header.pow.is_primary() && !header.pow.is_secondary() {
+			error!(
+				"block header {} validation error: invalid edge bits",
+				header.hash()
+			);
+			return Err(ser::Error::CorruptedData);
+		}
+		if let Err(e) = verify_size(&header) {
+			error!(
+				"block header {} validation error: invalid POW: {}",
+				header.hash(),
+				e
+			);
+			return Err(ser::Error::CorruptedData);
+		}
+
+		// Validate global output and kernel MMR sizes against upper bounds based on block height.
+		let global_weight =
+			TransactionBody::weight_by_iok(0, header.output_mmr_count(), header.kernel_mmr_count());
+		if global_weight > global::max_block_weight() * (header.height + 1) {
+			return Err(ser::Error::CorruptedData);
+		}
+
+		Ok(UntrustedBlockHeader(header))
+	}
+}
+
+/// A block as expressed in the Mimblewimble protocol. The reward is
 /// non-explicit, assumed to be deducible from block height (similar to
 /// bitcoin's schedule) and expressed as a global transaction fee (added v.H),
 /// additive to the total of fees ever collected.
@@ -404,7 +488,7 @@ pub struct Block {
 	/// The header with metadata and commitments to the rest of the data
 	pub header: BlockHeader,
 	/// The body - inputs/outputs/kernels
-	body: TransactionBody,
+	pub body: TransactionBody,
 }
 
 impl Hashed for Block {
@@ -420,8 +504,7 @@ impl Hashed for Block {
 impl Writeable for Block {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
 		self.header.write(writer)?;
-
-		if writer.serialization_mode() != ser::SerializationMode::Hash {
+		if !writer.serialization_mode().is_hash_mode() {
 			self.body.write(writer)?;
 		}
 		Ok(())
@@ -431,18 +514,9 @@ impl Writeable for Block {
 /// Implementation of Readable for a block, defines how to read a full block
 /// from a binary stream.
 impl Readable for Block {
-	fn read(reader: &mut dyn Reader) -> Result<Block, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<Block, ser::Error> {
 		let header = BlockHeader::read(reader)?;
-
 		let body = TransactionBody::read(reader)?;
-
-		// Now "lightweight" validation of the block.
-		// Treat any validation issues as data corruption.
-		// An example of this would be reading a block
-		// that exceeded the allowed number of inputs.
-		body.validate_read(Weighting::AsBlock)
-			.map_err(|_| ser::Error::CorruptedData)?;
-
 		Ok(Block { header, body })
 	}
 }
@@ -484,7 +558,7 @@ impl Block {
 	#[warn(clippy::new_ret_no_self)]
 	pub fn new(
 		prev: &BlockHeader,
-		txs: Vec<Transaction>,
+		txs: &[Transaction],
 		difficulty: Difficulty,
 		reward_output: (Output, TxKernel),
 	) -> Result<Block, Error> {
@@ -503,42 +577,40 @@ impl Block {
 	/// Hydrate a block from a compact block.
 	/// Note: caller must validate the block themselves, we do not validate it
 	/// here.
-	pub fn hydrate_from(cb: CompactBlock, txs: Vec<Transaction>) -> Result<Block, Error> {
+	pub fn hydrate_from(cb: CompactBlock, txs: &[Transaction]) -> Result<Block, Error> {
 		trace!("block: hydrate_from: {}, {} txs", cb.hash(), txs.len(),);
 
 		let header = cb.header.clone();
 
-		let mut all_inputs = HashSet::new();
-		let mut all_outputs = HashSet::new();
-		let mut all_kernels = HashSet::new();
+		let mut inputs = vec![];
+		let mut outputs = vec![];
+		let mut kernels = vec![];
 
 		// collect all the inputs, outputs and kernels from the txs
 		for tx in txs {
-			let tb: TransactionBody = tx.into();
-			all_inputs.extend(tb.inputs);
-			all_outputs.extend(tb.outputs);
-			all_kernels.extend(tb.kernels);
+			let tx_inputs: Vec<_> = tx.inputs().into();
+			inputs.extend_from_slice(tx_inputs.as_slice());
+			outputs.extend_from_slice(tx.outputs());
+			kernels.extend_from_slice(tx.kernels());
 		}
 
-		// include the coinbase output(s) and kernel(s) from the compact_block
-		{
-			let body: CompactBlockBody = cb.into();
-			all_outputs.extend(body.out_full);
-			all_kernels.extend(body.kern_full);
-		}
+		// apply cut-through to our tx inputs and outputs
+		let (inputs, outputs, _, _) = transaction::cut_through(&mut inputs, &mut outputs)?;
 
-		// convert the sets to vecs
-		let all_inputs = Vec::from_iter(all_inputs);
-		let all_outputs = Vec::from_iter(all_outputs);
-		let all_kernels = Vec::from_iter(all_kernels);
+		let mut outputs = outputs.to_vec();
+		let mut kernels = kernels.to_vec();
+
+		// include the full outputs and kernels from the compact block
+		outputs.extend_from_slice(cb.out_full());
+		kernels.extend_from_slice(cb.kern_full());
 
 		// Initialize a tx body and sort everything.
-		let body = TransactionBody::init(all_inputs, all_outputs, all_kernels, false)?;
+		let body = TransactionBody::init(inputs.into(), &outputs, &kernels, false)?;
 
 		// Finally return the full block.
 		// Note: we have not actually validated the block here,
 		// caller must validate the block.
-		Block { header, body }.cut_through()
+		Ok(Block { header, body })
 	}
 
 	/// Build a new empty block from a specified header
@@ -554,7 +626,7 @@ impl Block {
 	/// that all transactions are valid and calculates the Merkle tree.
 	pub fn from_reward(
 		prev: &BlockHeader,
-		txs: Vec<Transaction>,
+		txs: &[Transaction],
 		reward_out: Output,
 		reward_kern: TxKernel,
 		difficulty: Difficulty,
@@ -572,12 +644,9 @@ impl Block {
 			vec![],
 		)?;
 
+		// Determine the height and associated version for the new header.
 		let height = prev.height + 1;
-
-		let mut version = prev.version;
-		if !consensus::valid_header_version(height, version) {
-			version = version.next();
-		}
+		let version = consensus::header_version(height);
 
 		let now = Utc::now().timestamp();
 		let timestamp = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(now, 0), Utc);
@@ -585,7 +654,7 @@ impl Block {
 		// Now build the block with all the above information.
 		// Note: We have not validated the block here.
 		// Caller must validate the block as necessary.
-		Block {
+		let block = Block {
 			header: BlockHeader {
 				version,
 				height,
@@ -599,8 +668,8 @@ impl Block {
 				..Default::default()
 			},
 			body: agg_tx.into(),
-		}
-		.cut_through()
+		};
+		Ok(block)
 	}
 
 	/// Consumes this block and returns a new block with the coinbase output
@@ -612,61 +681,23 @@ impl Block {
 	}
 
 	/// Get inputs
-	pub fn inputs(&self) -> &Vec<Input> {
-		&self.body.inputs
-	}
-
-	/// Get inputs mutable
-	pub fn inputs_mut(&mut self) -> &mut Vec<Input> {
-		&mut self.body.inputs
+	pub fn inputs(&self) -> Inputs {
+		self.body.inputs()
 	}
 
 	/// Get outputs
-	pub fn outputs(&self) -> &Vec<Output> {
-		&self.body.outputs
-	}
-
-	/// Get outputs mutable
-	pub fn outputs_mut(&mut self) -> &mut Vec<Output> {
-		&mut self.body.outputs
+	pub fn outputs(&self) -> &[Output] {
+		&self.body.outputs()
 	}
 
 	/// Get kernels
-	pub fn kernels(&self) -> &Vec<TxKernel> {
-		&self.body.kernels
-	}
-
-	/// Get kernels mut
-	pub fn kernels_mut(&mut self) -> &mut Vec<TxKernel> {
-		&mut self.body.kernels
+	pub fn kernels(&self) -> &[TxKernel] {
+		&self.body.kernels()
 	}
 
 	/// Sum of all fees (inputs less outputs) in the block
 	pub fn total_fees(&self) -> u64 {
-		self.body
-			.kernels
-			.iter()
-			.fold(0, |acc, ref x| acc.saturating_add(x.fee))
-	}
-
-	/// Matches any output with a potential spending input, eliminating them
-	/// from the block. Provides a simple way to cut-through the block. The
-	/// elimination is stable with respect to the order of inputs and outputs.
-	/// Method consumes the block.
-	pub fn cut_through(self) -> Result<Block, Error> {
-		let mut inputs = self.inputs().clone();
-		let mut outputs = self.outputs().clone();
-		transaction::cut_through(&mut inputs, &mut outputs)?;
-
-		let kernels = self.kernels().clone();
-
-		// Initialize tx body and sort everything.
-		let body = TransactionBody::init(inputs, outputs, kernels, false)?;
-
-		Ok(Block {
-			header: self.header,
-			body,
-		})
+		self.body.fee(self.header.height)
 	}
 
 	/// "Lightweight" validation that we can perform quickly during read/deserialization.
@@ -705,20 +736,21 @@ impl Block {
 		&self,
 		prev_kernel_offset: &BlindingFactor,
 		verifier: Arc<RwLock<dyn VerifierCache>>,
-	) -> Result<Commitment, Error> {
+	) -> Result<(), Error> {
 		self.body.validate(Weighting::AsBlock, verifier)?;
 
 		self.verify_kernel_lock_heights()?;
+		self.verify_nrd_kernels_for_header_version()?;
 		self.verify_coinbase()?;
 
 		// take the kernel offset for this block (block offset minus previous) and
 		// verify.body.outputs and kernel sums
-		let (_utxo_sum, kernel_sum) = self.verify_kernel_sums(
+		self.verify_kernel_sums(
 			self.header.overage(),
 			self.block_kernel_offset(prev_kernel_offset.clone())?,
 		)?;
 
-		Ok(kernel_sum)
+		Ok(())
 	}
 
 	/// Validate the coinbase.body.outputs generated by miners.
@@ -758,14 +790,65 @@ impl Block {
 		Ok(())
 	}
 
+	// Verify any absolute kernel lock heights.
 	fn verify_kernel_lock_heights(&self) -> Result<(), Error> {
-		for k in &self.body.kernels {
+		for k in self.kernels() {
 			// check we have no kernels with lock_heights greater than current height
 			// no tx can be included in a block earlier than its lock_height
-			if k.lock_height > self.header.height {
-				return Err(Error::KernelLockHeight(k.lock_height));
+			if let KernelFeatures::HeightLocked { lock_height, .. } = k.features {
+				if lock_height > self.header.height {
+					return Err(Error::KernelLockHeight(lock_height));
+				}
 			}
 		}
 		Ok(())
+	}
+
+	// NRD kernels are not valid if the global feature flag is disabled.
+	// NRD kernels were introduced in HF3 and are not valid for block version < 4.
+	// Blocks prior to HF3 containing any NRD kernel(s) are invalid.
+	fn verify_nrd_kernels_for_header_version(&self) -> Result<(), Error> {
+		if self.kernels().iter().any(|k| k.is_nrd()) {
+			if !global::is_nrd_enabled() {
+				return Err(Error::NRDKernelNotEnabled);
+			}
+			if self.header.version < HeaderVersion(4) {
+				return Err(Error::NRDKernelPreHF3);
+			}
+		}
+		Ok(())
+	}
+}
+
+impl From<UntrustedBlock> for Block {
+	fn from(block: UntrustedBlock) -> Self {
+		block.0
+	}
+}
+
+/// Block which does lightweight validation as part of deserialization,
+/// it supposed to be used when we can't trust the channel (eg network)
+pub struct UntrustedBlock(Block);
+
+/// Deserialization of an untrusted block header
+impl Readable for UntrustedBlock {
+	fn read<R: Reader>(reader: &mut R) -> Result<UntrustedBlock, ser::Error> {
+		// we validate header here before parsing the body
+		let header = UntrustedBlockHeader::read(reader)?;
+		let body = TransactionBody::read(reader)?;
+
+		// Now "lightweight" validation of the block.
+		// Treat any validation issues as data corruption.
+		// An example of this would be reading a block
+		// that exceeded the allowed number of inputs.
+		body.validate_read(Weighting::AsBlock).map_err(|e| {
+			error!("read validation error: {}", e);
+			ser::Error::CorruptedData
+		})?;
+		let block = Block {
+			header: header.into(),
+			body,
+		};
+		Ok(UntrustedBlock(block))
 	}
 }

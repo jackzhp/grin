@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use crate::chain;
+use crate::core::consensus::YEAR_HEIGHT;
 use crate::core::core::hash::Hashed;
 use crate::core::core::merkle_proof::MerkleProof;
+use crate::core::core::{FeeFields, KernelFeatures, TxKernel};
 use crate::core::{core, ser};
 use crate::p2p;
-use crate::util;
 use crate::util::secp::pedersen;
+use crate::util::{self, ToHex};
 use serde;
 use serde::de::MapAccess;
 use serde::ser::SerializeStruct;
@@ -60,8 +60,8 @@ impl Tip {
 	pub fn from_tip(tip: chain::Tip) -> Tip {
 		Tip {
 			height: tip.height,
-			last_block_pushed: util::to_hex(tip.last_block_h.to_vec()),
-			prev_block_to_last: util::to_hex(tip.prev_block_h.to_vec()),
+			last_block_pushed: tip.last_block_h.to_hex(),
+			prev_block_to_last: tip.prev_block_h.to_hex(),
 			total_difficulty: tip.total_difficulty.to_num(),
 		}
 	}
@@ -78,15 +78,27 @@ pub struct Status {
 	pub connections: u32,
 	// The state of the current fork Tip
 	pub tip: Tip,
+	// The current sync status
+	pub sync_status: String,
+	// Additional sync information
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub sync_info: Option<serde_json::Value>,
 }
 
 impl Status {
-	pub fn from_tip_and_peers(current_tip: chain::Tip, connections: u32) -> Status {
+	pub fn from_tip_and_peers(
+		current_tip: chain::Tip,
+		connections: u32,
+		sync_status: String,
+		sync_info: Option<serde_json::Value>,
+	) -> Status {
 		Status {
 			protocol_version: ser::ProtocolVersion::local().into(),
 			user_agent: p2p::msg::USER_AGENT.to_string(),
 			connections: connections,
 			tip: Tip::from_tip(current_tip),
+			sync_status,
+			sync_info,
 		}
 	}
 }
@@ -103,13 +115,16 @@ pub struct TxHashSet {
 }
 
 impl TxHashSet {
-	pub fn from_head(head: Arc<chain::Chain>) -> TxHashSet {
-		let roots = head.get_txhashset_roots();
-		TxHashSet {
-			output_root_hash: roots.output_root.to_hex(),
-			range_proof_root_hash: roots.rproof_root.to_hex(),
-			kernel_root_hash: roots.kernel_root.to_hex(),
-		}
+	/// A TxHashSet in the context of the api is simply the collection of PMMR roots.
+	/// We can obtain these in a lightweight way by reading them from the head of the chain.
+	/// We will have validated the roots on this header against the roots of the txhashset.
+	pub fn from_head(chain: &chain::Chain) -> Result<TxHashSet, chain::Error> {
+		let header = chain.head_header()?;
+		Ok(TxHashSet {
+			output_root_hash: header.output_root.to_hex(),
+			range_proof_root_hash: header.range_proof_root.to_hex(),
+			kernel_root_hash: header.kernel_root.to_hex(),
+		})
 	}
 }
 
@@ -122,34 +137,32 @@ pub struct TxHashSetNode {
 }
 
 impl TxHashSetNode {
-	pub fn get_last_n_output(chain: Arc<chain::Chain>, distance: u64) -> Vec<TxHashSetNode> {
+	pub fn get_last_n_output(chain: &chain::Chain, distance: u64) -> Vec<TxHashSetNode> {
 		let mut return_vec = Vec::new();
 		let last_n = chain.get_last_n_output(distance);
 		for x in last_n {
+			return_vec.push(TxHashSetNode { hash: x.0.to_hex() });
+		}
+		return_vec
+	}
+
+	pub fn get_last_n_rangeproof(chain: &chain::Chain, distance: u64) -> Vec<TxHashSetNode> {
+		let mut return_vec = Vec::new();
+		let last_n = chain.get_last_n_rangeproof(distance);
+		for elem in last_n {
 			return_vec.push(TxHashSetNode {
-				hash: util::to_hex(x.0.to_vec()),
+				hash: elem.0.to_hex(),
 			});
 		}
 		return_vec
 	}
 
-	pub fn get_last_n_rangeproof(head: Arc<chain::Chain>, distance: u64) -> Vec<TxHashSetNode> {
+	pub fn get_last_n_kernel(chain: &chain::Chain, distance: u64) -> Vec<TxHashSetNode> {
 		let mut return_vec = Vec::new();
-		let last_n = head.get_last_n_rangeproof(distance);
+		let last_n = chain.get_last_n_kernel(distance);
 		for elem in last_n {
 			return_vec.push(TxHashSetNode {
-				hash: util::to_hex(elem.0.to_vec()),
-			});
-		}
-		return_vec
-	}
-
-	pub fn get_last_n_kernel(head: Arc<chain::Chain>, distance: u64) -> Vec<TxHashSetNode> {
-		let mut return_vec = Vec::new();
-		let last_n = head.get_last_n_kernel(distance);
-		for elem in last_n {
-			return_vec.push(TxHashSetNode {
-				hash: util::to_hex(elem.0.to_vec()),
+				hash: elem.0.to_hex(),
 			});
 		}
 		return_vec
@@ -175,9 +188,7 @@ pub struct Output {
 impl Output {
 	pub fn new(commit: &pedersen::Commitment, height: u64, mmr_index: u64) -> Output {
 		Output {
-			commit: PrintableCommitment {
-				commit: commit.clone(),
-			},
+			commit: PrintableCommitment { commit: *commit },
 			height: height,
 			mmr_index: mmr_index,
 		}
@@ -191,11 +202,17 @@ pub struct PrintableCommitment {
 
 impl PrintableCommitment {
 	pub fn commit(&self) -> pedersen::Commitment {
-		self.commit.clone()
+		self.commit
 	}
 
 	pub fn to_vec(&self) -> Vec<u8> {
 		self.commit.0.to_vec()
+	}
+}
+
+impl AsRef<[u8]> for PrintableCommitment {
+	fn as_ref(&self) -> &[u8] {
+		&self.commit.0
 	}
 }
 
@@ -204,7 +221,7 @@ impl serde::ser::Serialize for PrintableCommitment {
 	where
 		S: serde::ser::Serializer,
 	{
-		serializer.serialize_str(&util::to_hex(self.to_vec()))
+		serializer.serialize_str(&self.to_hex())
 	}
 }
 
@@ -232,7 +249,7 @@ impl<'de> serde::de::Visitor<'de> for PrintableCommitmentVisitor {
 	{
 		Ok(PrintableCommitment {
 			commit: pedersen::Commitment::from_vec(
-				util::from_hex(String::from(v)).map_err(serde::de::Error::custom)?,
+				util::from_hex(v).map_err(serde::de::Error::custom)?,
 			),
 		})
 	}
@@ -263,7 +280,7 @@ pub struct OutputPrintable {
 impl OutputPrintable {
 	pub fn from_output(
 		output: &core::Output,
-		chain: Arc<chain::Chain>,
+		chain: &chain::Chain,
 		block_header: Option<&core::BlockHeader>,
 		include_proof: bool,
 		include_merkle_proof: bool,
@@ -274,15 +291,23 @@ impl OutputPrintable {
 			OutputType::Transaction
 		};
 
-		let out_id = core::OutputIdentifier::from_output(&output);
-		let spent = chain.is_unspent(&out_id).is_err();
-		let block_height = match spent {
-			true => None,
-			false => Some(chain.get_header_for_output(&out_id)?.height),
-		};
+		let pos = chain.get_unspent(output.commitment())?;
+
+		let spent = pos.is_none();
+
+		// If output is unspent then we know its pos and height from the output_pos index.
+		// We use the header height directly for spent pos.
+		// Note: There is an interesting edge case here and we need to consider if the
+		// api is currently doing the right thing here:
+		// An output can be spent and then subsequently reused and the new instance unspent.
+		// This would result in a height that differs from the provided block height.
+		let output_pos = pos.map(|(_, x)| x.pos).unwrap_or(0);
+		let block_height = pos
+			.map(|(_, x)| x.height)
+			.or(block_header.map(|x| x.height));
 
 		let proof = if include_proof {
-			Some(util::to_hex(output.proof.proof.to_vec()))
+			Some(output.proof_bytes().to_hex())
 		} else {
 			None
 		};
@@ -294,18 +319,16 @@ impl OutputPrintable {
 		let mut merkle_proof = None;
 		if include_merkle_proof && output.is_coinbase() && !spent {
 			if let Some(block_header) = block_header {
-				merkle_proof = chain.get_merkle_proof(&out_id, &block_header).ok();
+				merkle_proof = chain.get_merkle_proof(output, &block_header).ok();
 			}
 		};
 
-		let output_pos = chain.get_output_pos(&output.commit).unwrap_or(0);
-
 		Ok(OutputPrintable {
 			output_type,
-			commit: output.commit,
+			commit: output.commitment(),
 			spent,
 			proof,
-			proof_hash: util::to_hex(output.proof.hash().to_vec()),
+			proof_hash: output.proof.hash().to_hex(),
 			block_height,
 			merkle_proof,
 			mmr_index: output_pos,
@@ -313,21 +336,19 @@ impl OutputPrintable {
 	}
 
 	pub fn commit(&self) -> Result<pedersen::Commitment, ser::Error> {
-		Ok(self.commit.clone())
+		Ok(self.commit)
 	}
 
 	pub fn range_proof(&self) -> Result<pedersen::RangeProof, ser::Error> {
-		let proof_str = match self.proof.clone() {
-			Some(p) => p,
-			None => return Err(ser::Error::HexError(format!("output range_proof missing"))),
-		};
+		let proof_str = self
+			.proof
+			.clone()
+			.ok_or_else(|| ser::Error::HexError("output range_proof missing".to_string()))?;
 
-		let p_vec = util::from_hex(proof_str)
-			.map_err(|_| ser::Error::HexError(format!("invalud output range_proof")))?;
+		let p_vec = util::from_hex(&proof_str)
+			.map_err(|_| ser::Error::HexError("invalid output range_proof".to_string()))?;
 		let mut p_bytes = [0; util::secp::constants::MAX_PROOF_SIZE];
-		for i in 0..p_bytes.len() {
-			p_bytes[i] = p_vec[i];
-		}
+		p_bytes.clone_from_slice(&p_vec[..util::secp::constants::MAX_PROOF_SIZE]);
 		Ok(pedersen::RangeProof {
 			proof: p_bytes,
 			plen: p_bytes.len(),
@@ -342,7 +363,7 @@ impl serde::ser::Serialize for OutputPrintable {
 	{
 		let mut state = serializer.serialize_struct("OutputPrintable", 7)?;
 		state.serialize_field("output_type", &self.output_type)?;
-		state.serialize_field("commit", &util::to_hex(self.commit.0.to_vec()))?;
+		state.serialize_field("commit", &self.commit.to_hex())?;
 		state.serialize_field("spent", &self.spent)?;
 		state.serialize_field("proof", &self.proof)?;
 		state.serialize_field("proof_hash", &self.proof_hash)?;
@@ -406,8 +427,7 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 							no_dup!(commit);
 
 							let val: String = map.next_value()?;
-							let vec =
-								util::from_hex(val.clone()).map_err(serde::de::Error::custom)?;
+							let vec = util::from_hex(&val).map_err(serde::de::Error::custom)?;
 							commit = Some(pedersen::Commitment::from_vec(vec));
 						}
 						Field::Spent => {
@@ -457,14 +477,14 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 					spent: spent.unwrap(),
 					proof: proof,
 					proof_hash: proof_hash.unwrap(),
-					block_height: block_height,
+					block_height: block_height.unwrap(),
 					merkle_proof: merkle_proof,
 					mmr_index: mmr_index.unwrap(),
 				})
 			}
 		}
 
-		const FIELDS: &'static [&'static str] = &[
+		const FIELDS: &[&str] = &[
 			"output_type",
 			"commit",
 			"spent",
@@ -480,6 +500,7 @@ impl<'de> serde::de::Deserialize<'de> for OutputPrintable {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TxKernelPrintable {
 	pub features: String,
+	pub fee_shift: u8,
 	pub fee: u64,
 	pub lock_height: u64,
 	pub excess: String,
@@ -488,12 +509,26 @@ pub struct TxKernelPrintable {
 
 impl TxKernelPrintable {
 	pub fn from_txkernel(k: &core::TxKernel) -> TxKernelPrintable {
+		let features = k.features.as_string();
+		let (fee_fields, lock_height) = match k.features {
+			KernelFeatures::Plain { fee } => (fee, 0),
+			KernelFeatures::Coinbase => (FeeFields::zero(), 0),
+			KernelFeatures::HeightLocked { fee, lock_height } => (fee, lock_height),
+			KernelFeatures::NoRecentDuplicate {
+				fee,
+				relative_height,
+			} => (fee, relative_height.into()),
+		};
+		let height = 2 * YEAR_HEIGHT; // print as if post-HF4
+		let fee = fee_fields.fee(height);
+		let fee_shift: u8 = fee_fields.fee_shift(height);
 		TxKernelPrintable {
-			features: format!("{:?}", k.features),
-			fee: k.fee,
-			lock_height: k.lock_height,
-			excess: util::to_hex(k.excess.0.to_vec()),
-			excess_sig: util::to_hex(k.excess_sig.to_raw_data().to_vec()),
+			features,
+			fee_shift,
+			fee,
+			lock_height,
+			excess: k.excess.to_hex(),
+			excess_sig: (&k.excess_sig.to_raw_data()[..]).to_hex(),
 		}
 	}
 }
@@ -512,9 +547,9 @@ pub struct BlockHeaderInfo {
 impl BlockHeaderInfo {
 	pub fn from_header(header: &core::BlockHeader) -> BlockHeaderInfo {
 		BlockHeaderInfo {
-			hash: util::to_hex(header.hash().to_vec()),
+			hash: header.hash().to_hex(),
 			height: header.height,
-			previous: util::to_hex(header.prev_hash.to_vec()),
+			previous: header.prev_hash.to_hex(),
 		}
 	}
 }
@@ -535,10 +570,14 @@ pub struct BlockHeaderPrintable {
 	pub timestamp: String,
 	/// Merklish root of all the commitments in the TxHashSet
 	pub output_root: String,
+	/// Size of the output MMR
+	pub output_mmr_size: u64,
 	/// Merklish root of all range proofs in the TxHashSet
 	pub range_proof_root: String,
 	/// Merklish root of all transaction kernels in the TxHashSet
 	pub kernel_root: String,
+	/// Size of the kernel MMR
+	pub kernel_mmr_size: u64,
 	/// Nonce increment used to mine this block.
 	pub nonce: u64,
 	/// Size of the cuckoo graph
@@ -556,15 +595,17 @@ pub struct BlockHeaderPrintable {
 impl BlockHeaderPrintable {
 	pub fn from_header(header: &core::BlockHeader) -> BlockHeaderPrintable {
 		BlockHeaderPrintable {
-			hash: util::to_hex(header.hash().to_vec()),
+			hash: header.hash().to_hex(),
 			version: header.version.into(),
 			height: header.height,
-			previous: util::to_hex(header.prev_hash.to_vec()),
-			prev_root: util::to_hex(header.prev_root.to_vec()),
+			previous: header.prev_hash.to_hex(),
+			prev_root: header.prev_root.to_hex(),
 			timestamp: header.timestamp.to_rfc3339(),
-			output_root: util::to_hex(header.output_root.to_vec()),
-			range_proof_root: util::to_hex(header.range_proof_root.to_vec()),
-			kernel_root: util::to_hex(header.kernel_root.to_vec()),
+			output_root: header.output_root.to_hex(),
+			output_mmr_size: header.output_mmr_size,
+			range_proof_root: header.range_proof_root.to_hex(),
+			kernel_root: header.kernel_root.to_hex(),
+			kernel_mmr_size: header.kernel_mmr_size,
 			nonce: header.pow.nonce,
 			edge_bits: header.pow.edge_bits(),
 			cuckoo_solution: header.pow.proof.nonces.clone(),
@@ -591,15 +632,12 @@ pub struct BlockPrintable {
 impl BlockPrintable {
 	pub fn from_block(
 		block: &core::Block,
-		chain: Arc<chain::Chain>,
+		chain: &chain::Chain,
 		include_proof: bool,
 		include_merkle_proof: bool,
 	) -> Result<BlockPrintable, chain::Error> {
-		let inputs = block
-			.inputs()
-			.iter()
-			.map(|x| util::to_hex(x.commitment().0.to_vec()))
-			.collect();
+		let inputs: Vec<_> = block.inputs().into();
+		let inputs = inputs.iter().map(|x| x.commitment().to_hex()).collect();
 		let outputs = block
 			.outputs()
 			.iter()
@@ -645,15 +683,13 @@ impl CompactBlockPrintable {
 	/// api response
 	pub fn from_compact_block(
 		cb: &core::CompactBlock,
-		chain: Arc<chain::Chain>,
+		chain: &chain::Chain,
 	) -> Result<CompactBlockPrintable, chain::Error> {
 		let block = chain.get_block(&cb.hash())?;
 		let out_full = cb
 			.out_full()
 			.iter()
-			.map(|x| {
-				OutputPrintable::from_output(x, chain.clone(), Some(&block.header), false, true)
-			})
+			.map(|x| OutputPrintable::from_output(x, chain, Some(&block.header), false, true))
 			.collect::<Result<Vec<_>, _>>()?;
 		let kern_full = cb
 			.kern_full()
@@ -691,6 +727,13 @@ pub struct OutputListing {
 	pub outputs: Vec<OutputPrintable>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LocatedTxKernel {
+	pub tx_kernel: TxKernel,
+	pub height: u64,
+	pub mmr_index: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PoolInfo {
 	/// Size of the pool
@@ -704,8 +747,7 @@ mod test {
 
 	#[test]
 	fn serialize_output_printable() {
-		let hex_output =
-			"{\
+		let hex_output = "{\
 			 \"output_type\":\"Coinbase\",\
 			 \"commit\":\"083eafae5d61a85ab07b12e1a51b3918d8e6de11fc6cde641d54af53608aa77b9f\",\
 			 \"spent\":false,\
@@ -722,8 +764,7 @@ mod test {
 
 	#[test]
 	fn serialize_output() {
-		let hex_commit =
-			"{\
+		let hex_commit = "{\
 			 \"commit\":\"083eafae5d61a85ab07b12e1a51b3918d8e6de11fc6cde641d54af53608aa77b9f\",\
 			 \"height\":0,\
 			 \"mmr_index\":0\

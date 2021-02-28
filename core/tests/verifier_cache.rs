@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,12 +17,10 @@ pub mod common;
 use self::core::core::verifier_cache::{LruVerifierCache, VerifierCache};
 use self::core::core::{Output, OutputFeatures};
 use self::core::libtx::proof;
-use self::keychain::{ExtKeychain, Keychain, SwitchCommitmentType};
-use self::util::RwLock;
 use grin_core as core;
-use grin_keychain as keychain;
-use grin_util as util;
+use keychain::{ExtKeychain, Keychain, SwitchCommitmentType};
 use std::sync::Arc;
+use util::RwLock;
 
 fn verifier_cache() -> Arc<RwLock<dyn VerifierCache>> {
 	Arc::new(RwLock::new(LruVerifierCache::new()))
@@ -34,21 +32,17 @@ fn test_verifier_cache_rangeproofs() {
 
 	let keychain = ExtKeychain::from_random_seed(false).unwrap();
 	let key_id = ExtKeychain::derive_key_id(1, 1, 0, 0, 0);
-	let switch = &SwitchCommitmentType::Regular;
+	let switch = SwitchCommitmentType::Regular;
 	let commit = keychain.commit(5, &key_id, switch).unwrap();
 	let builder = proof::ProofBuilder::new(&keychain);
 	let proof = proof::create(&keychain, &builder, 5, &key_id, switch, commit, None).unwrap();
 
-	let out = Output {
-		features: OutputFeatures::Plain,
-		commit: commit,
-		proof: proof,
-	};
+	let out = Output::new(OutputFeatures::Plain, commit, proof);
 
 	// Check our output is not verified according to the cache.
 	{
 		let mut cache = cache.write();
-		let unverified = cache.filter_rangeproof_unverified(&vec![out]);
+		let unverified = cache.filter_rangeproof_unverified(&[out]);
 		assert_eq!(unverified, vec![out]);
 	}
 
@@ -61,7 +55,7 @@ fn test_verifier_cache_rangeproofs() {
 	// Check it shows as verified according to the cache.
 	{
 		let mut cache = cache.write();
-		let unverified = cache.filter_rangeproof_unverified(&vec![out]);
+		let unverified = cache.filter_rangeproof_unverified(&[out]);
 		assert_eq!(unverified, vec![]);
 	}
 }

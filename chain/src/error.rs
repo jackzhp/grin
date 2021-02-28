@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 //! Error types for chain
+use crate::core::core::pmmr::segment;
 use crate::core::core::{block, committed, transaction};
 use crate::core::ser;
 use crate::keychain;
@@ -122,12 +123,18 @@ pub enum ErrorKind {
 	/// Tx not valid based on lock_height.
 	#[fail(display = "Transaction Lock Height")]
 	TxLockHeight,
+	/// Tx is not valid due to NRD relative_height restriction.
+	#[fail(display = "NRD Relative Height")]
+	NRDRelativeHeight,
 	/// No chain exists and genesis block is required
 	#[fail(display = "Genesis Block Required")]
 	GenesisBlockRequired,
 	/// Error from underlying tx handling
 	#[fail(display = "Transaction Validation Error: {:?}", _0)]
 	Transaction(transaction::Error),
+	/// Error from underlying block handling
+	#[fail(display = "Block Validation Error: {:?}", _0)]
+	Block(block::Error),
 	/// Anything else
 	#[fail(display = "Other Error: {}", _0)]
 	Other(String),
@@ -143,6 +150,15 @@ pub enum ErrorKind {
 	/// Error during chain sync
 	#[fail(display = "Sync error")]
 	SyncError(String),
+	/// PIBD segment related error
+	#[fail(display = "Segment error")]
+	SegmentError(segment::SegmentError),
+	/// The segmenter is associated to a different block header
+	#[fail(display = "Segmenter header mismatch")]
+	SegmenterHeaderMismatch,
+	/// Segment height not within allowed range
+	#[fail(display = "Invalid segment height")]
+	InvalidSegmentHeight,
 }
 
 impl Display for Error {
@@ -255,6 +271,22 @@ impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
 		Error {
 			inner: Context::new(ErrorKind::TxHashSetErr(e.to_string())),
+		}
+	}
+}
+
+impl From<ser::Error> for Error {
+	fn from(error: ser::Error) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::SerErr(error)),
+		}
+	}
+}
+
+impl From<segment::SegmentError> for Error {
+	fn from(error: segment::SegmentError) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::SegmentError(error)),
 		}
 	}
 }

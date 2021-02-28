@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,25 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::util::RwLock;
 use std::convert::From;
+use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::path::PathBuf;
-
-use std::sync::mpsc;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::prelude::*;
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+use grin_store;
 
 use crate::chain;
+use crate::chain::txhashset::BitmapChunk;
 use crate::core::core;
 use crate::core::core::hash::Hash;
+use crate::core::core::{OutputIdentifier, Segment, SegmentIdentifier, TxKernel};
 use crate::core::global;
 use crate::core::pow::Difficulty;
 use crate::core::ser::{self, ProtocolVersion, Readable, Reader, Writeable, Writer};
-use grin_store;
+use crate::msg::PeerAddrs;
+use crate::util::secp::pedersen::RangeProof;
+use crate::util::RwLock;
 
 /// Maximum number of block headers a peer should ever send
 pub const MAX_BLOCK_HEADERS: u32 = 512;
@@ -48,11 +55,18 @@ pub const MAX_LOCATORS: u32 = 20;
 /// How long a banned peer should be banned for
 const BAN_WINDOW: i64 = 10800;
 
-/// The max peer count
-const PEER_MAX_COUNT: u32 = 125;
+/// The max inbound peer count
+const PEER_MAX_INBOUND_COUNT: u32 = 128;
 
-/// min preferred peer count
-const PEER_MIN_PREFERRED_COUNT: u32 = 8;
+/// The max outbound peer count
+const PEER_MAX_OUTBOUND_COUNT: u32 = 8;
+
+/// The min preferred outbound peer count
+const PEER_MIN_PREFERRED_OUTBOUND_COUNT: u32 = 8;
+
+/// The peer listener buffer count. Allows temporarily accepting more connections
+/// than allowed by PEER_MAX_INBOUND_COUNT to encourage network bootstrapping.
+const PEER_LISTENER_BUFFER_COUNT: u32 = 8;
 
 #[derive(Debug)]
 pub enum Error {
@@ -60,6 +74,7 @@ pub enum Error {
 	Connection(io::Error),
 	/// Header type does not match the expected message type
 	BadMessage,
+	UnexpectedMessage,
 	MsgLen,
 	Banned,
 	ConnectionClose,
@@ -73,6 +88,8 @@ pub enum Error {
 		peer: Hash,
 	},
 	Send(String),
+	PeerNotFound,
+	PeerNotBanned,
 	PeerException,
 	Internal,
 }
@@ -95,11 +112,6 @@ impl From<chain::Error> for Error {
 impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
 		Error::Connection(e)
-	}
-}
-impl<T> From<mpsc::TrySendError<T>> for Error {
-	fn from(e: mpsc::TrySendError<T>) -> Error {
-		Error::Send(e.to_string())
 	}
 }
 
@@ -130,7 +142,7 @@ impl Writeable for PeerAddr {
 }
 
 impl Readable for PeerAddr {
-	fn read(reader: &mut dyn Reader) -> Result<PeerAddr, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<PeerAddr, ser::Error> {
 		let v4_or_v6 = reader.read_u8()?;
 		if v4_or_v6 == 0 {
 			let ip = reader.read_fixed_bytes(4)?;
@@ -141,14 +153,55 @@ impl Readable for PeerAddr {
 			))))
 		} else {
 			let ip = try_iter_map_vec!(0..8, |_| reader.read_u16());
+			let ipv6 = Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
 			let port = reader.read_u16()?;
-			Ok(PeerAddr(SocketAddr::V6(SocketAddrV6::new(
-				Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]),
-				port,
-				0,
-				0,
-			))))
+			if let Some(ipv4) = ipv6.to_ipv4() {
+				Ok(PeerAddr(SocketAddr::V4(SocketAddrV4::new(ipv4, port))))
+			} else {
+				Ok(PeerAddr(SocketAddr::V6(SocketAddrV6::new(
+					ipv6, port, 0, 0,
+				))))
+			}
 		}
+	}
+}
+
+impl<'de> Visitor<'de> for PeerAddrs {
+	type Value = PeerAddrs;
+
+	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+		formatter.write_str("an array of dns names or IP addresses")
+	}
+
+	fn visit_seq<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+	where
+		M: SeqAccess<'de>,
+	{
+		let mut peers = Vec::with_capacity(access.size_hint().unwrap_or(0));
+
+		while let Some(entry) = access.next_element::<&str>()? {
+			match SocketAddr::from_str(entry) {
+				// Try to parse IP address first
+				Ok(ip) => peers.push(PeerAddr(ip)),
+				// If that fails it's probably a DNS record
+				Err(_) => {
+					let socket_addrs = entry.to_socket_addrs().map_err(|_| {
+						serde::de::Error::custom(format!("Unable to resolve DNS: {}", entry))
+					})?;
+					peers.append(&mut socket_addrs.map(PeerAddr).collect());
+				}
+			}
+		}
+		Ok(PeerAddrs { peers })
+	}
+}
+
+impl<'de> Deserialize<'de> for PeerAddrs {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		deserializer.deserialize_seq(PeerAddrs { peers: vec![] })
 	}
 }
 
@@ -186,9 +239,9 @@ impl std::fmt::Display for PeerAddr {
 
 impl PeerAddr {
 	/// Convenient way of constructing a new peer_addr from an ip_addr
-	/// defaults to port 3414 on mainnet and 13414 on floonet.
+	/// defaults to port 3414 on mainnet and 13414 on testnet.
 	pub fn from_ip(addr: IpAddr) -> PeerAddr {
-		let port = if global::is_floonet() { 13414 } else { 3414 };
+		let port = if global::is_testnet() { 13414 } else { 3414 };
 		PeerAddr(SocketAddr::new(addr, port))
 	}
 
@@ -214,24 +267,24 @@ pub struct P2PConfig {
 	pub seeding_type: Seeding,
 
 	/// The list of seed nodes, if using Seeding as a seed type
-	pub seeds: Option<Vec<PeerAddr>>,
+	pub seeds: Option<PeerAddrs>,
 
-	/// Capabilities expose by this node, also conditions which other peers this
-	/// node will have an affinity toward when connection.
-	pub capabilities: Capabilities,
+	pub peers_allow: Option<PeerAddrs>,
 
-	pub peers_allow: Option<Vec<PeerAddr>>,
-
-	pub peers_deny: Option<Vec<PeerAddr>>,
+	pub peers_deny: Option<PeerAddrs>,
 
 	/// The list of preferred peers that we will try to connect to
-	pub peers_preferred: Option<Vec<PeerAddr>>,
+	pub peers_preferred: Option<PeerAddrs>,
 
 	pub ban_window: Option<i64>,
 
-	pub peer_max_count: Option<u32>,
+	pub peer_max_inbound_count: Option<u32>,
 
-	pub peer_min_preferred_count: Option<u32>,
+	pub peer_max_outbound_count: Option<u32>,
+
+	pub peer_min_preferred_outbound_count: Option<u32>,
+
+	pub peer_listener_buffer_count: Option<u32>,
 
 	pub dandelion_peer: Option<PeerAddr>,
 }
@@ -243,15 +296,16 @@ impl Default for P2PConfig {
 		P2PConfig {
 			host: ipaddr,
 			port: 3414,
-			capabilities: Capabilities::FULL_NODE,
 			seeding_type: Seeding::default(),
 			seeds: None,
 			peers_allow: None,
 			peers_deny: None,
 			peers_preferred: None,
 			ban_window: None,
-			peer_max_count: None,
-			peer_min_preferred_count: None,
+			peer_max_inbound_count: None,
+			peer_max_outbound_count: None,
+			peer_min_preferred_outbound_count: None,
+			peer_listener_buffer_count: None,
 			dandelion_peer: None,
 		}
 	}
@@ -268,19 +322,35 @@ impl P2PConfig {
 		}
 	}
 
-	/// return peer_max_count
-	pub fn peer_max_count(&self) -> u32 {
-		match self.peer_max_count {
+	/// return maximum inbound peer connections count
+	pub fn peer_max_inbound_count(&self) -> u32 {
+		match self.peer_max_inbound_count {
 			Some(n) => n,
-			None => PEER_MAX_COUNT,
+			None => PEER_MAX_INBOUND_COUNT,
 		}
 	}
 
-	/// return peer_preferred_count
-	pub fn peer_min_preferred_count(&self) -> u32 {
-		match self.peer_min_preferred_count {
+	/// return maximum outbound peer connections count
+	pub fn peer_max_outbound_count(&self) -> u32 {
+		match self.peer_max_outbound_count {
 			Some(n) => n,
-			None => PEER_MIN_PREFERRED_COUNT,
+			None => PEER_MAX_OUTBOUND_COUNT,
+		}
+	}
+
+	/// return minimum preferred outbound peer count
+	pub fn peer_min_preferred_outbound_count(&self) -> u32 {
+		match self.peer_min_preferred_outbound_count {
+			Some(n) => n,
+			None => PEER_MIN_PREFERRED_OUTBOUND_COUNT,
+		}
+	}
+
+	/// return peer buffer count for listener
+	pub fn peer_listener_buffer_count(&self) -> u32 {
+		match self.peer_listener_buffer_count {
+			Some(n) => n,
+			None => PEER_LISTENER_BUFFER_COUNT,
 		}
 	}
 }
@@ -290,7 +360,7 @@ impl P2PConfig {
 pub enum Seeding {
 	/// No seeding, mostly for tests that programmatically connect
 	None,
-	/// A list of seed addresses provided to the server
+	/// A list of seeds provided to the server (can be addresses or DNS names)
 	List,
 	/// Automatically get a list of seeds from multiple DNS
 	DNSSeed,
@@ -309,26 +379,31 @@ bitflags! {
 	#[derive(Serialize, Deserialize)]
 	pub struct Capabilities: u32 {
 		/// We don't know (yet) what the peer can do.
-		const UNKNOWN = 0b00000000;
+		const UNKNOWN = 0b0000_0000;
 		/// Can provide full history of headers back to genesis
 		/// (for at least one arbitrary fork).
-		const HEADER_HIST = 0b00000001;
-		/// Can provide block headers and the TxHashSet for some recent-enough
-		/// height.
-		const TXHASHSET_HIST = 0b00000010;
+		const HEADER_HIST = 0b0000_0001;
+		/// Can provide recent txhashset archive for fast sync.
+		const TXHASHSET_HIST = 0b0000_0010;
 		/// Can provide a list of healthy peers
-		const PEER_LIST = 0b00000100;
+		const PEER_LIST = 0b0000_0100;
 		/// Can broadcast and request txs by kernel hash.
-		const TX_KERNEL_HASH = 0b00001000;
+		const TX_KERNEL_HASH = 0b0000_1000;
+		/// Can provide PIBD segments during initial byte download (fast sync).
+		const PIBD_HIST = 0b0001_0000;
+		/// Can provide historical blocks for archival sync.
+		const BLOCK_HIST = 0b0010_0000;
+	}
+}
 
-		/// All nodes right now are "full nodes".
-		/// Some nodes internally may maintain longer block histories (archival_mode)
-		/// but we do not advertise this to other nodes.
-		/// All nodes by default will accept lightweight "kernel first" tx broadcast.
-		const FULL_NODE = Capabilities::HEADER_HIST.bits
-			| Capabilities::TXHASHSET_HIST.bits
-			| Capabilities::PEER_LIST.bits
-			| Capabilities::TX_KERNEL_HASH.bits;
+/// Default capabilities.
+impl Default for Capabilities {
+	fn default() -> Self {
+		Capabilities::HEADER_HIST
+			| Capabilities::TXHASHSET_HIST
+			| Capabilities::PEER_LIST
+			| Capabilities::TX_KERNEL_HASH
+			| Capabilities::PIBD_HIST
 	}
 }
 
@@ -398,6 +473,10 @@ impl PeerInfo {
 		self.direction == Direction::Outbound
 	}
 
+	pub fn is_inbound(&self) -> bool {
+		self.direction == Direction::Inbound
+	}
+
 	/// The current height of the peer.
 	pub fn height(&self) -> u64 {
 		self.live_info.read().height
@@ -442,11 +521,11 @@ pub struct PeerInfoDisplay {
 impl From<PeerInfo> for PeerInfoDisplay {
 	fn from(info: PeerInfo) -> PeerInfoDisplay {
 		PeerInfoDisplay {
-			capabilities: info.capabilities.clone(),
+			capabilities: info.capabilities,
 			user_agent: info.user_agent.clone(),
 			version: info.version,
-			addr: info.addr.clone(),
-			direction: info.direction.clone(),
+			addr: info.addr,
+			direction: info.direction,
 			total_difficulty: info.total_difficulty(),
 			height: info.height(),
 		}
@@ -494,7 +573,7 @@ pub trait ChainAdapter: Sync + Send {
 		&self,
 		b: core::Block,
 		peer_info: &PeerInfo,
-		was_requested: bool,
+		opts: chain::Options,
 	) -> Result<bool, chain::Error>;
 
 	fn compact_block_received(
@@ -524,11 +603,8 @@ pub trait ChainAdapter: Sync + Send {
 	fn locate_headers(&self, locator: &[Hash]) -> Result<Vec<core::BlockHeader>, chain::Error>;
 
 	/// Gets a full block by its hash.
-	fn get_block(&self, h: Hash) -> Option<core::Block>;
-
-	fn kernel_data_read(&self) -> Result<File, chain::Error>;
-
-	fn kernel_data_write(&self, reader: &mut Read) -> Result<bool, chain::Error>;
+	/// Converts block to v2 compatibility if necessary (based on peer protocol version).
+	fn get_block(&self, h: Hash, peer_info: &PeerInfo) -> Option<core::Block>;
 
 	/// Provides a reading view into the current txhashset state as well as
 	/// the required indexes for a consumer to rewind to a consistant state
@@ -569,6 +645,30 @@ pub trait ChainAdapter: Sync + Send {
 	/// Get a tmp file path in above specific tmp dir (create tmp dir if not exist)
 	/// Delete file if tmp file already exists
 	fn get_tmpfile_pathname(&self, tmpfile_name: String) -> PathBuf;
+
+	fn get_kernel_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<Segment<TxKernel>, chain::Error>;
+
+	fn get_bitmap_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<(Segment<BitmapChunk>, Hash), chain::Error>;
+
+	fn get_output_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<(Segment<OutputIdentifier>, Hash), chain::Error>;
+
+	fn get_rangeproof_segment(
+		&self,
+		hash: Hash,
+		id: SegmentIdentifier,
+	) -> Result<Segment<RangeProof>, chain::Error>;
 }
 
 /// Additional methods required by the protocol that don't need to be
@@ -586,4 +686,20 @@ pub trait NetAdapter: ChainAdapter {
 
 	/// Is this peer currently banned?
 	fn is_banned(&self, addr: PeerAddr) -> bool;
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachmentMeta {
+	pub size: usize,
+	pub hash: Hash,
+	pub height: u64,
+	pub start_time: DateTime<Utc>,
+	pub path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachmentUpdate {
+	pub read: usize,
+	pub left: usize,
+	pub meta: Arc<AttachmentMeta>,
 }

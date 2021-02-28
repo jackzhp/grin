@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,16 +13,18 @@
 // limitations under the License.
 
 use std::fs::File;
-use std::io::{self, Read};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io;
+use std::net::{IpAddr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::chain;
+use crate::chain::txhashset::BitmapChunk;
 use crate::core::core;
 use crate::core::core::hash::Hash;
+use crate::core::core::{OutputIdentifier, Segment, SegmentIdentifier, TxKernel};
 use crate::core::global;
 use crate::core::pow::Difficulty;
 use crate::handshake::Handshake;
@@ -33,6 +35,7 @@ use crate::types::{
 	Capabilities, ChainAdapter, Error, NetAdapter, P2PConfig, PeerAddr, PeerInfo, ReasonForBan,
 	TxHashSetRead,
 };
+use crate::util::secp::pedersen::RangeProof;
 use crate::util::StopState;
 use chrono::prelude::{DateTime, Utc};
 
@@ -51,7 +54,7 @@ impl Server {
 	/// Creates a new idle p2p server with no peers
 	pub fn new(
 		db_root: &str,
-		capab: Capabilities,
+		capabilities: Capabilities,
 		config: P2PConfig,
 		adapter: Arc<dyn ChainAdapter>,
 		genesis: Hash,
@@ -59,7 +62,7 @@ impl Server {
 	) -> Result<Server, Error> {
 		Ok(Server {
 			config: config.clone(),
-			capabilities: capab,
+			capabilities,
 			handshake: Arc::new(Handshake::new(genesis, config.clone())),
 			peers: Arc::new(Peers::new(PeerStore::new(db_root)?, adapter, config)),
 			stop_state,
@@ -84,9 +87,34 @@ impl Server {
 
 			match listener.accept() {
 				Ok((stream, peer_addr)) => {
-					let peer_addr = PeerAddr(peer_addr);
+					// We want out TCP stream to be in blocking mode.
+					// The TCP listener is in nonblocking mode so we *must* explicitly
+					// move the accepted TCP stream into blocking mode (or all kinds of
+					// bad things can and will happen).
+					// A nonblocking TCP listener will accept nonblocking TCP streams which
+					// we do not want.
+					stream.set_nonblocking(false)?;
+
+					let mut peer_addr = PeerAddr(peer_addr);
+
+					// attempt to see if it an ipv4-mapped ipv6
+					// if yes convert to ipv4
+					if peer_addr.0.is_ipv6() {
+						if let IpAddr::V6(ipv6) = peer_addr.0.ip() {
+							if let Some(ipv4) = ipv6.to_ipv4() {
+								peer_addr = PeerAddr(SocketAddr::V4(SocketAddrV4::new(
+									ipv4,
+									peer_addr.0.port(),
+								)))
+							}
+						}
+					}
 
 					if self.check_undesirable(&stream) {
+						// Shutdown the incoming TCP connection if it is not desired
+						if let Err(e) = stream.shutdown(Shutdown::Both) {
+							debug!("Error shutting down conn: {:?}", e);
+						}
 						continue;
 					}
 					match self.handle_new_peer(stream) {
@@ -194,31 +222,47 @@ impl Server {
 		Ok(())
 	}
 
-	/// Checks whether there's any reason we don't want to accept a peer
-	/// connection. There can be a couple of them:
-	/// 1. The peer has been previously banned and the ban period hasn't
+	/// Checks whether there's any reason we don't want to accept an incoming peer
+	/// connection. There can be a few of them:
+	/// 1. Accepting the peer connection would exceed the configured maximum allowed
+	/// inbound peer count. Note that seed nodes may wish to increase the default
+	/// value for PEER_LISTENER_BUFFER_COUNT to help with network bootstrapping.
+	/// A default buffer of 8 peers is allowed to help with network growth.
+	/// 2. The peer has been previously banned and the ban period hasn't
 	/// expired yet.
-	/// 2. We're already connected to a peer at the same IP. While there are
+	/// 3. We're already connected to a peer at the same IP. While there are
 	/// many reasons multiple peers can legitimately share identical IP
 	/// addresses (NAT), network distribution is improved if they choose
 	/// different sets of peers themselves. In addition, it prevent potential
 	/// duplicate connections, malicious or not.
 	fn check_undesirable(&self, stream: &TcpStream) -> bool {
+		if self.peers.iter().inbound().connected().count() as u32
+			>= self.config.peer_max_inbound_count() + self.config.peer_listener_buffer_count()
+		{
+			debug!("Accepting new connection will exceed peer limit, refusing connection.");
+			return true;
+		}
 		if let Ok(peer_addr) = stream.peer_addr() {
 			let peer_addr = PeerAddr(peer_addr);
 			if self.peers.is_banned(peer_addr) {
 				debug!("Peer {} banned, refusing connection.", peer_addr);
-				if let Err(e) = stream.shutdown(Shutdown::Both) {
-					debug!("Error shutting down conn: {:?}", e);
-				}
 				return true;
 			}
-			if self.peers.is_known(peer_addr) {
-				debug!("Peer {} already known, refusing connection.", peer_addr);
-				if let Err(e) = stream.shutdown(Shutdown::Both) {
-					debug!("Error shutting down conn: {:?}", e);
+			// The call to is_known() can fail due to contention on the peers map.
+			// If it fails we want to default to refusing the connection.
+			match self.peers.is_known(peer_addr) {
+				Ok(true) => {
+					debug!("Peer {} already known, refusing connection.", peer_addr);
+					return true;
 				}
-				return true;
+				Err(_) => {
+					error!(
+						"Peer {} is_known check failed, refusing connection.",
+						peer_addr
+					);
+					return true;
+				}
+				_ => (),
 			}
 		}
 		false
@@ -243,7 +287,7 @@ pub struct DummyAdapter {}
 
 impl ChainAdapter for DummyAdapter {
 	fn total_difficulty(&self) -> Result<Difficulty, chain::Error> {
-		Ok(Difficulty::min())
+		Ok(Difficulty::min_dma())
 	}
 	fn total_height(&self) -> Result<u64, chain::Error> {
 		Ok(0)
@@ -276,7 +320,12 @@ impl ChainAdapter for DummyAdapter {
 	) -> Result<bool, chain::Error> {
 		Ok(true)
 	}
-	fn block_received(&self, _: core::Block, _: &PeerInfo, _: bool) -> Result<bool, chain::Error> {
+	fn block_received(
+		&self,
+		_: core::Block,
+		_: &PeerInfo,
+		_: chain::Options,
+	) -> Result<bool, chain::Error> {
 		Ok(true)
 	}
 	fn headers_received(
@@ -289,14 +338,8 @@ impl ChainAdapter for DummyAdapter {
 	fn locate_headers(&self, _: &[Hash]) -> Result<Vec<core::BlockHeader>, chain::Error> {
 		Ok(vec![])
 	}
-	fn get_block(&self, _: Hash) -> Option<core::Block> {
+	fn get_block(&self, _: Hash, _: &PeerInfo) -> Option<core::Block> {
 		None
-	}
-	fn kernel_data_read(&self) -> Result<File, chain::Error> {
-		unimplemented!()
-	}
-	fn kernel_data_write(&self, _reader: &mut Read) -> Result<bool, chain::Error> {
-		unimplemented!()
 	}
 	fn txhashset_read(&self, _h: Hash) -> Option<TxHashSetRead> {
 		unimplemented!()
@@ -333,6 +376,38 @@ impl ChainAdapter for DummyAdapter {
 	}
 
 	fn get_tmpfile_pathname(&self, _tmpfile_name: String) -> PathBuf {
+		unimplemented!()
+	}
+
+	fn get_kernel_segment(
+		&self,
+		_hash: Hash,
+		_id: SegmentIdentifier,
+	) -> Result<Segment<TxKernel>, chain::Error> {
+		unimplemented!()
+	}
+
+	fn get_bitmap_segment(
+		&self,
+		_hash: Hash,
+		_id: SegmentIdentifier,
+	) -> Result<(Segment<BitmapChunk>, Hash), chain::Error> {
+		unimplemented!()
+	}
+
+	fn get_output_segment(
+		&self,
+		_hash: Hash,
+		_id: SegmentIdentifier,
+	) -> Result<(Segment<OutputIdentifier>, Hash), chain::Error> {
+		unimplemented!()
+	}
+
+	fn get_rangeproof_segment(
+		&self,
+		_hash: Hash,
+		_id: SegmentIdentifier,
+	) -> Result<Segment<RangeProof>, chain::Error> {
 		unimplemented!()
 	}
 }

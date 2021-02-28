@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,9 +23,10 @@ use std::sync::Arc;
 
 use crate::chain::store::ChainStore;
 use crate::chain::txhashset;
+use crate::core::core::hash::Hashed;
 use crate::core::core::BlockHeader;
+use crate::core::global;
 use crate::util::file;
-use grin_core::core::hash::Hashed;
 
 fn clean_output_dir(dir_name: &str) {
 	let _ = fs::remove_dir_all(dir_name);
@@ -33,6 +34,7 @@ fn clean_output_dir(dir_name: &str) {
 
 #[test]
 fn test_unexpected_zip() {
+	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 	let db_root = format!(".grin_txhashset_zip");
 	clean_output_dir(&db_root);
 	{
@@ -84,8 +86,6 @@ fn test_unexpected_zip() {
 		);
 
 		assert!(txhashset::zip_read(db_root.clone(), &head).is_ok());
-		let txhashset_zip_path =
-			Path::new(&db_root).join(format!("txhashset_zip_{}", head.hash().to_string()));
 		let _ = fs::remove_dir_all(
 			Path::new(&db_root).join(format!("txhashset_zip_{}", head.hash().to_string())),
 		);

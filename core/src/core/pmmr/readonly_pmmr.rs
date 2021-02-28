@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,10 @@
 
 use std::marker;
 
-use crate::core::hash::{Hash, ZERO_HASH};
-use crate::core::pmmr::pmmr::{bintree_rightmost, insertion_to_pmmr_index, peaks};
+use crate::core::hash::Hash;
+use crate::core::pmmr::pmmr::{bintree_rightmost, ReadablePMMR};
 use crate::core::pmmr::{is_leaf, Backend};
-use crate::ser::{PMMRIndexHashable, PMMRable};
+use crate::ser::PMMRable;
 
 /// Readonly view of a PMMR.
 pub struct ReadonlyPMMR<'a, T, B>
@@ -59,96 +59,30 @@ where
 		}
 	}
 
-	/// Get the data element at provided position in the MMR.
-	pub fn get_data(&self, pos: u64) -> Option<T::E> {
-		if pos > self.last_pos {
-			// If we are beyond the rhs of the MMR return None.
-			None
-		} else if is_leaf(pos) {
-			// If we are a leaf then get data from the backend.
-			self.backend.get_data(pos)
-		} else {
-			// If we are not a leaf then return None as only leaves have data.
-			None
-		}
-	}
-
-	/// Get the hash at provided position in the MMR.
-	pub fn get_hash(&self, pos: u64) -> Option<Hash> {
-		if pos > self.last_pos {
-			None
-		} else if is_leaf(pos) {
-			// If we are a leaf then get hash from the backend.
-			self.backend.get_hash(pos)
-		} else {
-			// If we are not a leaf get hash ignoring the remove log.
-			self.backend.get_from_file(pos)
-		}
-	}
-
-	/// Is the MMR empty?
-	pub fn is_empty(&self) -> bool {
-		self.last_pos == 0
-	}
-
-	/// Computes the root of the MMR. Find all the peaks in the current
-	/// tree and "bags" them to get a single peak.
-	pub fn root(&self) -> Hash {
-		if self.is_empty() {
-			return ZERO_HASH;
-		}
-		let mut res = None;
-		for peak in self.peaks().iter().rev() {
-			res = match res {
-				None => Some(*peak),
-				Some(rhash) => Some((*peak, rhash).hash_with_index(self.unpruned_size())),
-			}
-		}
-		res.expect("no root, invalid tree")
-	}
-
-	/// Returns a vec of the peaks of this MMR.
-	pub fn peaks(&self) -> Vec<Hash> {
-		let peaks_pos = peaks(self.last_pos);
-		peaks_pos
-			.into_iter()
-			.filter_map(|pi| {
-				// here we want to get from underlying hash file
-				// as the pos *may* have been "removed"
-				self.backend.get_from_file(pi)
-			})
-			.collect()
-	}
-
-	/// Total size of the tree, including intermediary nodes and ignoring any
-	/// pruning.
-	pub fn unpruned_size(&self) -> u64 {
-		self.last_pos
-	}
-
 	/// Helper function which returns un-pruned nodes from the insertion index
 	/// forward
-	/// returns last insertion index returned along with data
-	pub fn elements_from_insertion_index(
+	/// returns last pmmr index returned along with data
+	pub fn elements_from_pmmr_index(
 		&self,
-		mut index: u64,
+		mut pmmr_index: u64,
 		max_count: u64,
+		max_pmmr_pos: Option<u64>,
 	) -> (u64, Vec<T::E>) {
 		let mut return_vec = vec![];
-		if index == 0 {
-			index = 1;
+		let last_pos = match max_pmmr_pos {
+			Some(p) => p,
+			None => self.last_pos,
+		};
+		if pmmr_index == 0 {
+			pmmr_index = 1;
 		}
-		let mut return_index = index;
-		let mut pmmr_index = insertion_to_pmmr_index(index);
-		while return_vec.len() < max_count as usize && pmmr_index <= self.last_pos {
+		while return_vec.len() < max_count as usize && pmmr_index <= last_pos {
 			if let Some(t) = self.get_data(pmmr_index) {
 				return_vec.push(t);
-				return_index = index;
 			}
-			index += 1;
-			pmmr_index = insertion_to_pmmr_index(index);
+			pmmr_index += 1;
 		}
-		(return_index, return_vec)
+		(pmmr_index.saturating_sub(1), return_vec)
 	}
 
 	/// Helper function to get the last N nodes inserted, i.e. the last
@@ -171,5 +105,78 @@ where
 			last_leaf -= 1;
 		}
 		return_vec
+	}
+}
+
+impl<'a, T, B> ReadablePMMR for ReadonlyPMMR<'a, T, B>
+where
+	T: PMMRable,
+	B: 'a + Backend<T>,
+{
+	type Item = T::E;
+
+	fn get_hash(&self, pos: u64) -> Option<Hash> {
+		if pos > self.last_pos {
+			None
+		} else if is_leaf(pos) {
+			// If we are a leaf then get hash from the backend.
+			self.backend.get_hash(pos)
+		} else {
+			// If we are not a leaf get hash ignoring the remove log.
+			self.backend.get_from_file(pos)
+		}
+	}
+
+	fn get_data(&self, pos: u64) -> Option<Self::Item> {
+		if pos > self.last_pos {
+			// If we are beyond the rhs of the MMR return None.
+			None
+		} else if is_leaf(pos) {
+			// If we are a leaf then get data from the backend.
+			self.backend.get_data(pos)
+		} else {
+			// If we are not a leaf then return None as only leaves have data.
+			None
+		}
+	}
+
+	fn get_from_file(&self, pos: u64) -> Option<Hash> {
+		if pos > self.last_pos {
+			None
+		} else {
+			self.backend.get_from_file(pos)
+		}
+	}
+
+	fn get_peak_from_file(&self, pos: u64) -> Option<Hash> {
+		if pos > self.last_pos {
+			None
+		} else {
+			self.backend.get_peak_from_file(pos)
+		}
+	}
+
+	fn get_data_from_file(&self, pos: u64) -> Option<Self::Item> {
+		if pos > self.last_pos {
+			None
+		} else {
+			self.backend.get_data_from_file(pos)
+		}
+	}
+
+	fn unpruned_size(&self) -> u64 {
+		self.last_pos
+	}
+
+	fn leaf_pos_iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+		self.backend.leaf_pos_iter()
+	}
+
+	fn leaf_idx_iter(&self, from_idx: u64) -> Box<dyn Iterator<Item = u64> + '_> {
+		self.backend.leaf_idx_iter(from_idx)
+	}
+
+	fn n_unpruned_leaves(&self) -> u64 {
+		self.backend.n_unpruned_leaves()
 	}
 }

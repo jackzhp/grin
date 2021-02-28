@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::convert::TryInto;
 /// Utility to track the rate of data transfers
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 struct Entry {
 	bytes: u64,
@@ -77,7 +78,7 @@ impl RateCounter {
 
 	fn truncate(&mut self) {
 		let now_millis = millis_since_epoch();
-		while self.last_min_entries.len() > 0
+		while !self.last_min_entries.is_empty()
 			&& self.last_min_entries[0].timestamp + 60000 < now_millis
 		{
 			self.last_min_entries.remove(0);
@@ -98,13 +99,21 @@ impl RateCounter {
 			.filter(|x| !x.is_quiet())
 			.count() as u64
 	}
+
+	/// Elapsed time in ms since the last entry.
+	/// We use this to rate limit when sending.
+	pub fn elapsed_since_last_msg(&self) -> Option<u64> {
+		self.last_min_entries
+			.last()
+			.map(|x| millis_since_epoch().saturating_sub(x.timestamp))
+	}
 }
 
 // turns out getting the millisecs since epoch in Rust isn't as easy as it
 // could be
 fn millis_since_epoch() -> u64 {
-	let since_epoch = SystemTime::now()
+	SystemTime::now()
 		.duration_since(SystemTime::UNIX_EPOCH)
-		.unwrap_or(Duration::new(0, 0));
-	since_epoch.as_secs() * 1000 + since_epoch.subsec_millis() as u64
+		.map(|since_epoch| since_epoch.as_millis().try_into().unwrap_or(0))
+		.unwrap_or(0)
 }

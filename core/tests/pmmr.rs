@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod vec_backend;
+mod common;
 
 use self::core::core::hash::Hash;
-use self::core::core::pmmr::{self, PMMR};
+use self::core::core::pmmr::{self, ReadablePMMR, VecBackend, PMMR};
 use self::core::ser::PMMRIndexHashable;
-use crate::vec_backend::{TestElem, VecBackend};
+use crate::common::TestElem;
 use chrono::prelude::Utc;
 use grin_core as core;
 use std::u64;
@@ -41,7 +41,7 @@ fn some_peak_map() {
 fn bench_peak_map() {
 	let nano_to_millis = 1.0 / 1_000_000.0;
 
-	let increments = vec![1000_000u64, 10_000_000u64, 100_000_000u64];
+	let increments = vec![1_000_000u64, 10_000_000u64, 100_000_000u64];
 
 	for v in increments {
 		let start = Utc::now().timestamp_nanos();
@@ -88,6 +88,18 @@ fn first_100_mmr_heights() {
 		);
 		count += 1;
 	}
+}
+
+#[test]
+fn test_bintree_range() {
+	assert_eq!(pmmr::bintree_range(0), 0..1);
+	assert_eq!(pmmr::bintree_range(1), 1..2);
+	assert_eq!(pmmr::bintree_range(2), 2..3);
+	assert_eq!(pmmr::bintree_range(3), 1..4);
+	assert_eq!(pmmr::bintree_range(4), 4..5);
+	assert_eq!(pmmr::bintree_range(5), 5..6);
+	assert_eq!(pmmr::bintree_range(6), 4..7);
+	assert_eq!(pmmr::bintree_range(7), 1..8);
 }
 
 // The pos of the rightmost leaf for the provided MMR size (last leaf in subtree).
@@ -150,10 +162,9 @@ fn various_families() {
 
 #[test]
 fn test_paths() {
-	assert_eq!(pmmr::path(1, 1), [1]);
-	assert_eq!(pmmr::path(1, 3), [1, 3]);
-	assert_eq!(pmmr::path(2, 3), [2, 3]);
-	assert_eq!(pmmr::path(4, 16), [4, 6, 7, 15]);
+	assert_eq!(pmmr::path(1, 3).collect::<Vec<_>>(), [1, 3]);
+	assert_eq!(pmmr::path(2, 3).collect::<Vec<_>>(), [2, 3]);
+	assert_eq!(pmmr::path(4, 16).collect::<Vec<_>>(), [4, 6, 7, 15]);
 }
 
 #[test]
@@ -374,7 +385,7 @@ fn pmmr_get_last_n_insertions() {
 
 	// test when empty
 	let res = pmmr.readonly_pmmr().get_last_n_insertions(19);
-	assert!(res.len() == 0);
+	assert!(res.is_empty());
 
 	pmmr.push(&elems[0]).unwrap();
 	let res = pmmr.readonly_pmmr().get_last_n_insertions(19);
@@ -433,7 +444,7 @@ fn pmmr_prune() {
 
 	// First check the initial numbers of elements.
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 0);
+	assert_eq!(ba.removed.len(), 0);
 
 	// pruning a leaf with no parent should do nothing
 	{
@@ -442,7 +453,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 1);
+	assert_eq!(ba.removed.len(), 1);
 
 	// pruning leaves with no shared parent just removes 1 element
 	{
@@ -451,7 +462,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 2);
+	assert_eq!(ba.removed.len(), 2);
 
 	{
 		let mut pmmr: PMMR<'_, TestElem, _> = PMMR::at(&mut ba, sz);
@@ -459,7 +470,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 3);
+	assert_eq!(ba.removed.len(), 3);
 
 	// pruning a non-leaf node has no effect
 	{
@@ -468,7 +479,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 3);
+	assert_eq!(ba.removed.len(), 3);
 
 	// TODO - no longer true (leaves only now) - pruning sibling removes subtree
 	{
@@ -477,7 +488,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 4);
+	assert_eq!(ba.removed.len(), 4);
 
 	// TODO - no longer true (leaves only now) - pruning all leaves under level >1
 	// removes all subtree
@@ -487,7 +498,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 5);
+	assert_eq!(ba.removed.len(), 5);
 
 	// pruning everything should only leave us with a single peak
 	{
@@ -498,7 +509,7 @@ fn pmmr_prune() {
 		assert_eq!(orig_root, pmmr.root().unwrap());
 	}
 	assert_eq!(ba.hashes.len(), 16);
-	assert_eq!(ba.remove_list.len(), 9);
+	assert_eq!(ba.removed.len(), 9);
 }
 
 #[test]
@@ -514,46 +525,48 @@ fn check_insertion_to_pmmr_index() {
 }
 
 #[test]
-fn check_elements_from_insertion_index() {
+fn check_elements_from_pmmr_index() {
 	let mut ba = VecBackend::new();
 	let mut pmmr = PMMR::new(&mut ba);
-	for x in 1..1000 {
+	// 20 elements should give max index 38
+	for x in 1..21 {
 		pmmr.push(&TestElem([0, 0, 0, x])).unwrap();
 	}
+
 	// Normal case
-	let res = pmmr.readonly_pmmr().elements_from_insertion_index(1, 100);
-	assert_eq!(res.0, 100);
-	assert_eq!(res.1.len(), 100);
+	let res = pmmr.readonly_pmmr().elements_from_pmmr_index(1, 1000, None);
+	assert_eq!(res.0, 38);
+	assert_eq!(res.1.len(), 20);
 	assert_eq!(res.1[0].0[3], 1);
-	assert_eq!(res.1[99].0[3], 100);
+	assert_eq!(res.1[19].0[3], 20);
 
 	// middle of pack
-	let res = pmmr.readonly_pmmr().elements_from_insertion_index(351, 70);
-	assert_eq!(res.0, 420);
-	assert_eq!(res.1.len(), 70);
-	assert_eq!(res.1[0].0[3], 351);
-	assert_eq!(res.1[69].0[3], 420);
-
-	// past the end
 	let res = pmmr
 		.readonly_pmmr()
-		.elements_from_insertion_index(650, 1000);
-	assert_eq!(res.0, 999);
-	assert_eq!(res.1.len(), 350);
-	assert_eq!(res.1[0].0[3], 650);
-	assert_eq!(res.1[349].0[3], 999);
+		.elements_from_pmmr_index(8, 1000, Some(34));
+	assert_eq!(res.0, 34);
+	assert_eq!(res.1.len(), 14);
+	assert_eq!(res.1[0].0[3], 5);
+	assert_eq!(res.1[13].0[3], 18);
+
+	// bounded
+	let res = pmmr
+		.readonly_pmmr()
+		.elements_from_pmmr_index(8, 7, Some(34));
+	assert_eq!(res.0, 19);
+	assert_eq!(res.1.len(), 7);
+	assert_eq!(res.1[0].0[3], 5);
+	assert_eq!(res.1[6].0[3], 11);
 
 	// pruning a few nodes should get consistent results
-	pmmr.prune(pmmr::insertion_to_pmmr_index(650)).unwrap();
-	pmmr.prune(pmmr::insertion_to_pmmr_index(651)).unwrap();
-	pmmr.prune(pmmr::insertion_to_pmmr_index(800)).unwrap();
-	pmmr.prune(pmmr::insertion_to_pmmr_index(900)).unwrap();
-	pmmr.prune(pmmr::insertion_to_pmmr_index(998)).unwrap();
+	pmmr.prune(pmmr::insertion_to_pmmr_index(5)).unwrap();
+	pmmr.prune(pmmr::insertion_to_pmmr_index(20)).unwrap();
+
 	let res = pmmr
 		.readonly_pmmr()
-		.elements_from_insertion_index(650, 1000);
-	assert_eq!(res.0, 999);
-	assert_eq!(res.1.len(), 345);
-	assert_eq!(res.1[0].0[3], 652);
-	assert_eq!(res.1[344].0[3], 999);
+		.elements_from_pmmr_index(8, 7, Some(34));
+	assert_eq!(res.0, 20);
+	assert_eq!(res.1.len(), 7);
+	assert_eq!(res.1[0].0[3], 6);
+	assert_eq!(res.1[6].0[3], 12);
 }

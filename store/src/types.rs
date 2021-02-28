@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,8 +16,7 @@ use memmap;
 use tempfile::tempfile;
 
 use crate::core::ser::{
-	self, BinWriter, FixedLength, ProtocolVersion, Readable, Reader, StreamingReader, Writeable,
-	Writer,
+	self, BinWriter, ProtocolVersion, Readable, Reader, StreamingReader, Writeable, Writer,
 };
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
@@ -39,12 +38,13 @@ pub struct SizeEntry {
 	pub size: u16,
 }
 
-impl FixedLength for SizeEntry {
-	const LEN: usize = 8 + 2;
+impl SizeEntry {
+	/// Length of a size entry (8 + 2 bytes) for convenience.
+	pub const LEN: u16 = 8 + 2;
 }
 
 impl Readable for SizeEntry {
-	fn read(reader: &mut dyn Reader) -> Result<SizeEntry, ser::Error> {
+	fn read<R: Reader>(reader: &mut R) -> Result<SizeEntry, ser::Error> {
 		Ok(SizeEntry {
 			offset: reader.read_u64()?,
 			size: reader.read_u16()?,
@@ -99,6 +99,14 @@ where
 		Ok(self.size_unsync())
 	}
 
+	/// Append a slice of multiple elements to the file.
+	/// Will not be written to disk until flush() is subsequently called.
+	/// Alternatively discard() may be called to discard any pending changes.
+	pub fn extend_from_slice(&mut self, data: &[T]) -> io::Result<u64> {
+		self.file.append_elmts(data)?;
+		Ok(self.size_unsync())
+	}
+
 	/// Read an element from the file by position.
 	/// Assumes we have already "shifted" the position to account for pruned data.
 	/// Note: PMMR API is 1-indexed, but backend storage is 0-indexed.
@@ -107,10 +115,7 @@ where
 	/// Elements can be of variable size (handled internally in the append-only file impl).
 	///
 	pub fn read(&self, position: u64) -> Option<T> {
-		match self.file.read_as_elmt(position - 1) {
-			Ok(x) => Some(x),
-			Err(_) => None,
-		}
+		self.file.read_as_elmt(position - 1).ok()
 	}
 
 	/// Rewind the backend file to the specified position.
@@ -143,23 +148,22 @@ where
 		self.file.path()
 	}
 
-	/// Create a new tempfile containing the contents of this data file.
-	/// This allows callers to see a consistent view of the data without
-	/// locking the data file.
-	pub fn as_temp_file(&self) -> io::Result<File> {
-		self.file.as_temp_file()
-	}
-
 	/// Drop underlying file handles
 	pub fn release(&mut self) {
 		self.file.release();
 	}
 
 	/// Write the file out to disk, pruning removed elements.
-	pub fn save_prune(&mut self, prune_pos: &[u64]) -> io::Result<()> {
+	pub fn write_tmp_pruned(&self, prune_pos: &[u64]) -> io::Result<()> {
 		// Need to convert from 1-index to 0-index (don't ask).
-		let prune_idx: Vec<_> = prune_pos.into_iter().map(|x| x - 1).collect();
-		self.file.save_prune(prune_idx.as_slice())
+		let prune_idx: Vec<_> = prune_pos.iter().map(|x| x - 1).collect();
+		self.file.write_tmp_pruned(prune_idx.as_slice())
+	}
+
+	/// Replace with file at tmp path.
+	/// Rebuild and initialize from new file.
+	pub fn replace_with_tmp(&mut self) -> io::Result<()> {
+		self.file.replace_with_tmp()
 	}
 }
 
@@ -183,6 +187,17 @@ pub struct AppendOnlyFile<T> {
 	buffer_start_pos: u64,
 	buffer_start_pos_bak: u64,
 	_marker: marker::PhantomData<T>,
+}
+
+impl AppendOnlyFile<SizeEntry> {
+	fn sum_sizes(&self) -> io::Result<u64> {
+		let mut sum = 0;
+		for pos in 0..self.buffer_start_pos {
+			let entry = self.read_as_elmt(pos)?;
+			sum += entry.size as u64;
+		}
+		Ok(sum)
+	}
 }
 
 impl<T> AppendOnlyFile<T>
@@ -215,8 +230,9 @@ where
 		// This will occur during "fast sync" as we do not sync the size_file
 		// and must build it locally.
 		// And we can *only* do this after init() the data file (so we know sizes).
+		let expected_size = aof.size()?;
 		if let SizeInfo::VariableSize(ref mut size_file) = &mut aof.size_info {
-			if size_file.size()? == 0 {
+			if size_file.sum_sizes()? != expected_size {
 				aof.rebuild_size_file()?;
 
 				// (Re)init the entire file as we just rebuilt the size_file
@@ -275,6 +291,14 @@ where
 		let mut bytes = ser::ser_vec(data, self.version)
 			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 		self.append(&mut bytes)?;
+		Ok(())
+	}
+
+	/// Iterate over the slice and append each element.
+	fn append_elmts(&mut self, data: &[T]) -> io::Result<()> {
+		for x in data {
+			self.append_elmt(x)?;
+		}
 		Ok(())
 	}
 
@@ -467,39 +491,43 @@ where
 		Ok(file)
 	}
 
+	fn tmp_path(&self) -> PathBuf {
+		self.path.with_extension("tmp")
+	}
+
 	/// Saves a copy of the current file content, skipping data at the provided
 	/// prune positions. prune_pos must be ordered.
-	pub fn save_prune(&mut self, prune_pos: &[u64]) -> io::Result<()> {
-		let tmp_path = self.path.with_extension("tmp");
+	pub fn write_tmp_pruned(&self, prune_pos: &[u64]) -> io::Result<()> {
+		let reader = File::open(&self.path)?;
+		let mut buf_reader = BufReader::new(reader);
+		let mut streaming_reader = StreamingReader::new(&mut buf_reader, self.version);
 
-		// Scope the reader and writer to within the block so we can safely replace files later on.
-		{
-			let reader = File::open(&self.path)?;
-			let mut buf_reader = BufReader::new(reader);
-			let mut streaming_reader = StreamingReader::new(&mut buf_reader, self.version);
+		let mut buf_writer = BufWriter::new(File::create(&self.tmp_path())?);
+		let mut bin_writer = BinWriter::new(&mut buf_writer, self.version);
 
-			let mut buf_writer = BufWriter::new(File::create(&tmp_path)?);
-			let mut bin_writer = BinWriter::new(&mut buf_writer, self.version);
-
-			let mut current_pos = 0;
-			let mut prune_pos = prune_pos;
-			while let Ok(elmt) = T::read(&mut streaming_reader) {
-				if prune_pos.contains(&current_pos) {
-					// Pruned pos, moving on.
-					prune_pos = &prune_pos[1..];
-				} else {
-					// Not pruned, write to file.
-					elmt.write(&mut bin_writer)
-						.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-				}
-				current_pos += 1;
+		let mut current_pos = 0;
+		let mut prune_pos = prune_pos;
+		while let Ok(elmt) = T::read(&mut streaming_reader) {
+			if prune_pos.contains(&current_pos) {
+				// Pruned pos, moving on.
+				prune_pos = &prune_pos[1..];
+			} else {
+				// Not pruned, write to file.
+				elmt.write(&mut bin_writer)
+					.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 			}
-			buf_writer.flush()?;
+			current_pos += 1;
 		}
+		buf_writer.flush()?;
+		Ok(())
+	}
 
+	/// Replace the underlying file with the file at tmp path.
+	/// Rebuild and initialize from the new file.
+	pub fn replace_with_tmp(&mut self) -> io::Result<()> {
 		// Replace the underlying file -
 		// pmmr_data.tmp -> pmmr_data.bin
-		self.replace(&tmp_path)?;
+		self.replace(&self.tmp_path())?;
 
 		// Now rebuild our size file to reflect the pruned data file.
 		// This will replace the underlying file internally.
@@ -517,6 +545,7 @@ where
 		if let SizeInfo::VariableSize(ref mut size_file) = &mut self.size_info {
 			// Note: Reading from data file and writing sizes to the associated (tmp) size_file.
 			let tmp_path = size_file.path.with_extension("tmp");
+			debug!("rebuild_size_file: {:?}", tmp_path);
 
 			// Scope the reader and writer to within the block so we can safely replace files later on.
 			{

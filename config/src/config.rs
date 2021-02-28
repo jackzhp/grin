@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,16 +30,18 @@ use crate::core::global;
 use crate::p2p;
 use crate::servers::ServerConfig;
 use crate::types::{ConfigError, ConfigMembers, GlobalConfig};
-use crate::util::LoggingConfig;
+use crate::util::logger::LoggingConfig;
 
 /// The default file name to use when trying to derive
 /// the node config file location
-pub const SERVER_CONFIG_FILE_NAME: &'static str = "grin-server.toml";
-const SERVER_LOG_FILE_NAME: &'static str = "grin-server.log";
-const GRIN_HOME: &'static str = ".grin";
-const GRIN_CHAIN_DIR: &'static str = "chain_data";
-/// Node API secret
-pub const API_SECRET_FILE_NAME: &'static str = ".api_secret";
+pub const SERVER_CONFIG_FILE_NAME: &str = "grin-server.toml";
+const SERVER_LOG_FILE_NAME: &str = "grin-server.log";
+const GRIN_HOME: &str = ".grin";
+const GRIN_CHAIN_DIR: &str = "chain_data";
+/// Node Rest API and V2 Owner API secret
+pub const API_SECRET_FILE_NAME: &str = ".api_secret";
+/// Foreign API secret
+pub const FOREIGN_API_SECRET_FILE_NAME: &str = ".foreign_api_secret";
 
 fn get_grin_path(chain_type: &global::ChainTypes) -> Result<PathBuf, ConfigError> {
 	// Check if grin dir exists
@@ -95,11 +97,14 @@ pub fn check_api_secret(api_secret_path: &PathBuf) -> Result<(), ConfigError> {
 	Ok(())
 }
 
-/// Check that the api secret file exists and is valid
-fn check_api_secret_file(chain_type: &global::ChainTypes) -> Result<(), ConfigError> {
+/// Check that the api secret files exist and are valid
+fn check_api_secret_files(
+	chain_type: &global::ChainTypes,
+	secret_file_name: &str,
+) -> Result<(), ConfigError> {
 	let grin_path = get_grin_path(chain_type)?;
-	let mut api_secret_path = grin_path.clone();
-	api_secret_path.push(API_SECRET_FILE_NAME);
+	let mut api_secret_path = grin_path;
+	api_secret_path.push(secret_file_name);
 	if !api_secret_path.exists() {
 		init_api_secret(&api_secret_path)
 	} else {
@@ -109,7 +114,8 @@ fn check_api_secret_file(chain_type: &global::ChainTypes) -> Result<(), ConfigEr
 
 /// Handles setup and detection of paths for node
 pub fn initial_setup_server(chain_type: &global::ChainTypes) -> Result<GlobalConfig, ConfigError> {
-	check_api_secret_file(chain_type)?;
+	check_api_secret_files(chain_type, API_SECRET_FILE_NAME)?;
+	check_api_secret_files(chain_type, FOREIGN_API_SECRET_FILE_NAME)?;
 	// Use config file if current directory if it exists, .grin home otherwise
 	if let Some(p) = check_config_current_dir(SERVER_CONFIG_FILE_NAME) {
 		GlobalConfig::new(p.to_str().unwrap())
@@ -162,7 +168,7 @@ impl GlobalConfig {
 
 		match *chain_type {
 			global::ChainTypes::Mainnet => {}
-			global::ChainTypes::Floonet => {
+			global::ChainTypes::Testnet => {
 				defaults.api_http_addr = "127.0.0.1:13413".to_owned();
 				defaults.p2p_config.port = 13414;
 				defaults
@@ -221,7 +227,8 @@ impl GlobalConfig {
 		let mut file = File::open(self.config_file_path.as_mut().unwrap())?;
 		let mut contents = String::new();
 		file.read_to_string(&mut contents)?;
-		let decoded: Result<ConfigMembers, toml::de::Error> = toml::from_str(&contents);
+		let fixed = GlobalConfig::fix_warning_level(contents);
+		let decoded: Result<ConfigMembers, toml::de::Error> = toml::from_str(&fixed);
 		match decoded {
 			Ok(gc) => {
 				self.members = Some(gc);
@@ -229,15 +236,8 @@ impl GlobalConfig {
 			}
 			Err(e) => {
 				return Err(ConfigError::ParseError(
-					String::from(
-						self.config_file_path
-							.as_mut()
-							.unwrap()
-							.to_str()
-							.unwrap()
-							.clone(),
-					),
-					String::from(format!("{}", e)),
+					self.config_file_path.unwrap().to_str().unwrap().to_string(),
+					format!("{}", e),
 				));
 			}
 		}
@@ -249,10 +249,17 @@ impl GlobalConfig {
 		let mut chain_path = grin_home.clone();
 		chain_path.push(GRIN_CHAIN_DIR);
 		self.members.as_mut().unwrap().server.db_root = chain_path.to_str().unwrap().to_owned();
-		let mut secret_path = grin_home.clone();
-		secret_path.push(API_SECRET_FILE_NAME);
+		let mut api_secret_path = grin_home.clone();
+		api_secret_path.push(API_SECRET_FILE_NAME);
 		self.members.as_mut().unwrap().server.api_secret_path =
-			Some(secret_path.to_str().unwrap().to_owned());
+			Some(api_secret_path.to_str().unwrap().to_owned());
+		let mut foreign_api_secret_path = grin_home.clone();
+		foreign_api_secret_path.push(FOREIGN_API_SECRET_FILE_NAME);
+		self.members
+			.as_mut()
+			.unwrap()
+			.server
+			.foreign_api_secret_path = Some(foreign_api_secret_path.to_str().unwrap().to_owned());
 		let mut log_path = grin_home.clone();
 		log_path.push(SERVER_LOG_FILE_NAME);
 		self.members
@@ -285,10 +292,7 @@ impl GlobalConfig {
 		match encoded {
 			Ok(enc) => return Ok(enc),
 			Err(e) => {
-				return Err(ConfigError::SerializationError(String::from(format!(
-					"{}",
-					e
-				))));
+				return Err(ConfigError::SerializationError(format!("{}", e)));
 			}
 		}
 	}
@@ -296,9 +300,38 @@ impl GlobalConfig {
 	/// Write configuration to a file
 	pub fn write_to_file(&mut self, name: &str) -> Result<(), ConfigError> {
 		let conf_out = self.ser_config()?;
-		let conf_out = insert_comments(conf_out);
+		let fixed_config = GlobalConfig::fix_log_level(conf_out);
+		let commented_config = insert_comments(fixed_config);
 		let mut file = File::create(name)?;
-		file.write_all(conf_out.as_bytes())?;
+		file.write_all(commented_config.as_bytes())?;
 		Ok(())
 	}
+
+	// For forwards compatibility old config needs `Warning` log level changed to standard log::Level `WARN`
+	fn fix_warning_level(conf: String) -> String {
+		conf.replace("Warning", "WARN")
+	}
+
+	// For backwards compatibility only first letter of log level should be capitalised.
+	fn fix_log_level(conf: String) -> String {
+		conf.replace("TRACE", "Trace")
+			.replace("DEBUG", "Debug")
+			.replace("INFO", "Info")
+			.replace("WARN", "Warning")
+			.replace("ERROR", "Error")
+	}
+}
+
+#[test]
+fn test_fix_log_level() {
+	let config = "TRACE DEBUG INFO WARN ERROR".to_string();
+	let fixed_config = GlobalConfig::fix_log_level(config);
+	assert_eq!(fixed_config, "Trace Debug Info Warning Error");
+}
+
+#[test]
+fn test_fix_warning_level() {
+	let config = "Warning".to_string();
+	let fixed_config = GlobalConfig::fix_warning_level(config);
+	assert_eq!(fixed_config, "WARN");
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-use std::fs::File;
 
 use croaring::Bitmap;
 
@@ -29,7 +27,7 @@ pub trait Backend<T: PMMRable> {
 	/// associated data element to flatfile storage (for leaf nodes only). The
 	/// position of the first element of the Vec in the MMR is provided to
 	/// help the implementation.
-	fn append(&mut self, data: &T, hashes: Vec<Hash>) -> Result<(), String>;
+	fn append(&mut self, data: &T, hashes: &[Hash]) -> Result<(), String>;
 
 	/// Rewind the backend state to a previous position, as if all append
 	/// operations after that had been canceled. Expects a position in the PMMR
@@ -48,23 +46,30 @@ pub trait Backend<T: PMMRable> {
 	/// (ignoring the remove log).
 	fn get_from_file(&self, position: u64) -> Option<Hash>;
 
+	/// Get hash for peak pos.
+	/// Optimized for reading peak hashes rather than arbitrary pos hashes.
+	/// Peaks can be assumed to not be compacted.
+	fn get_peak_from_file(&self, position: u64) -> Option<Hash>;
+
 	/// Get a Data Element by original insertion position
 	/// (ignoring the remove log).
 	fn get_data_from_file(&self, position: u64) -> Option<T::E>;
 
 	/// Iterator over current (unpruned, unremoved) leaf positions.
-	fn leaf_pos_iter(&self) -> Box<Iterator<Item = u64> + '_>;
+	fn leaf_pos_iter(&self) -> Box<dyn Iterator<Item = u64> + '_>;
+
+	/// Number of leaves
+	fn n_unpruned_leaves(&self) -> u64;
+
+	/// Iterator over current (unpruned, unremoved) leaf insertion index.
+	/// Note: This differs from underlying MMR pos - [0, 1, 2, 3, 4] vs. [1, 2, 4, 5, 8].
+	fn leaf_idx_iter(&self, from_idx: u64) -> Box<dyn Iterator<Item = u64> + '_>;
 
 	/// Remove Hash by insertion position. An index is also provided so the
 	/// underlying backend can implement some rollback of positions up to a
 	/// given index (practically the index is the height of a block that
 	/// triggered removal).
 	fn remove(&mut self, position: u64) -> Result<(), String>;
-
-	/// Creates a temp file containing the contents of the underlying data file
-	/// from the backend storage. This allows a caller to see a consistent view
-	/// of the data without needing to lock the backend storage.
-	fn data_as_temp_file(&self) -> Result<File, String>;
 
 	/// Release underlying datafiles and locks
 	fn release_files(&mut self);

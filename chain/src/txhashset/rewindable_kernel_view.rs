@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,18 +14,14 @@
 
 //! Lightweight readonly view into kernel MMR for convenience.
 
-use std::fs::File;
-
-use crate::core::core::pmmr::RewindablePMMR;
+use crate::core::core::pmmr::{ReadablePMMR, ReadonlyPMMR, RewindablePMMR};
 use crate::core::core::{BlockHeader, TxKernel};
 use crate::error::{Error, ErrorKind};
-use crate::store::Batch;
 use grin_store::pmmr::PMMRBackend;
 
 /// Rewindable (but readonly) view of the kernel set (based on kernel MMR).
 pub struct RewindableKernelView<'a> {
 	pmmr: RewindablePMMR<'a, TxKernel, PMMRBackend<TxKernel>>,
-	batch: &'a Batch<'a>,
 	header: BlockHeader,
 }
 
@@ -33,21 +29,9 @@ impl<'a> RewindableKernelView<'a> {
 	/// Build a new readonly kernel view.
 	pub fn new(
 		pmmr: RewindablePMMR<'a, TxKernel, PMMRBackend<TxKernel>>,
-		batch: &'a Batch<'_>,
 		header: BlockHeader,
 	) -> RewindableKernelView<'a> {
-		RewindableKernelView {
-			pmmr,
-			batch,
-			header,
-		}
-	}
-
-	/// Accessor for the batch used in this view.
-	/// We will discard this batch (rollback) at the end, so be aware of this.
-	/// Nothing will get written to the db/index via this view.
-	pub fn batch(&self) -> &'a Batch<'_> {
-		self.batch
+		RewindableKernelView { pmmr, header }
 	}
 
 	/// Rewind this readonly view to a previous block.
@@ -70,7 +54,10 @@ impl<'a> RewindableKernelView<'a> {
 	/// fast sync where a reorg past the horizon could allow a whole rewrite of
 	/// the kernel set.
 	pub fn validate_root(&self) -> Result<(), Error> {
-		let root = self.pmmr.root().map_err(|_| ErrorKind::InvalidRoot)?;
+		let root = self
+			.readonly_pmmr()
+			.root()
+			.map_err(|_| ErrorKind::InvalidRoot)?;
 		if root != self.header.kernel_root {
 			return Err(ErrorKind::InvalidTxHashSet(format!(
 				"Kernel root at {} does not match",
@@ -81,13 +68,8 @@ impl<'a> RewindableKernelView<'a> {
 		Ok(())
 	}
 
-	/// Read the "raw" kernel backend data file (via temp file for consistent view on data).
-	pub fn kernel_data_read(&self) -> Result<File, Error> {
-		let file = self
-			.pmmr
-			.backend()
-			.data_as_temp_file()
-			.map_err(|_| ErrorKind::FileReadErr("Data file woes".into()))?;
-		Ok(file)
+	/// Readonly view of our internal data.
+	pub fn readonly_pmmr(&self) -> ReadonlyPMMR<TxKernel, PMMRBackend<TxKernel>> {
+		self.pmmr.as_readonly()
 	}
 }

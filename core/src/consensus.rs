@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,11 +18,11 @@
 //! enough, consensus-relevant constants and short functions should be kept
 //! here.
 
-use std::cmp::{max, min};
-
 use crate::core::block::HeaderVersion;
+use crate::core::hash::{Hash, ZERO_HASH};
 use crate::global;
 use crate::pow::Difficulty;
+use std::cmp::{max, min};
 
 /// A grin is divisible to 10^9, following the SI prefixes
 pub const GRIN_BASE: u64 = 1_000_000_000;
@@ -47,8 +47,11 @@ pub fn reward(fee: u64) -> u64 {
 	REWARD.saturating_add(fee)
 }
 
+/// an hour in seconds
+pub const HOUR_SEC: u64 = 60 * 60;
+
 /// Nominal height for standard time intervals, hour is 60 blocks
-pub const HOUR_HEIGHT: u64 = 3600 / BLOCK_TIME_SEC;
+pub const HOUR_HEIGHT: u64 = HOUR_SEC / BLOCK_TIME_SEC;
 /// A day is 1440 blocks
 pub const DAY_HEIGHT: u64 = 24 * HOUR_HEIGHT;
 /// A week is 10_080 blocks
@@ -66,19 +69,13 @@ pub fn secondary_pow_ratio(height: u64) -> u64 {
 	90u64.saturating_sub(height / (2 * YEAR_HEIGHT / 90))
 }
 
-/// The AR scale damping factor to use. Dependent on block height
-/// to account for pre HF behavior on testnet4.
-fn ar_scale_damp_factor(_height: u64) -> u64 {
-	AR_SCALE_DAMP_FACTOR
-}
-
 /// Cuckoo-cycle proof size (cycle length)
 pub const PROOFSIZE: usize = 42;
 
 /// Default Cuckatoo Cycle edge_bits, used for mining and validating.
 pub const DEFAULT_MIN_EDGE_BITS: u8 = 31;
 
-/// Cuckaroo proof-of-work edge_bits, meant to be ASIC resistant.
+/// Cuckaroo* proof-of-work edge_bits, meant to be ASIC resistant.
 pub const SECOND_POW_EDGE_BITS: u8 = 29;
 
 /// Original reference edge_bits to compute difficulty factors for higher
@@ -102,13 +99,13 @@ pub const CUT_THROUGH_HORIZON: u32 = WEEK_HEIGHT as u32;
 pub const STATE_SYNC_THRESHOLD: u32 = 2 * DAY_HEIGHT as u32;
 
 /// Weight of an input when counted against the max block weight capacity
-pub const BLOCK_INPUT_WEIGHT: usize = 1;
+pub const INPUT_WEIGHT: u64 = 1;
 
 /// Weight of an output when counted against the max block weight capacity
-pub const BLOCK_OUTPUT_WEIGHT: usize = 21;
+pub const OUTPUT_WEIGHT: u64 = 21;
 
 /// Weight of a kernel when counted against the max block weight capacity
-pub const BLOCK_KERNEL_WEIGHT: usize = 3;
+pub const KERNEL_WEIGHT: u64 = 3;
 
 /// Total maximum block weight. At current sizes, this means a maximum
 /// theoretical size of:
@@ -122,84 +119,98 @@ pub const BLOCK_KERNEL_WEIGHT: usize = 3;
 /// `(1 * 2) + (21 * 2) + (3 * 1) = 47` (weight per tx)
 /// `40_000 / 47 = 851` (txs per block)
 ///
-pub const MAX_BLOCK_WEIGHT: usize = 40_000;
+pub const MAX_BLOCK_WEIGHT: u64 = 40_000;
 
 /// Fork every 6 months.
 pub const HARD_FORK_INTERVAL: u64 = YEAR_HEIGHT / 2;
 
-/// Floonet first hard fork height, set to happen around 2019-06-20
-pub const FLOONET_FIRST_HARD_FORK: u64 = 185_040;
+/// Testnet first hard fork height, set to happen around 2019-06-20
+pub const TESTNET_FIRST_HARD_FORK: u64 = 185_040;
 
-/// Check whether the block version is valid at a given height, implements
+/// Testnet second hard fork height, set to happen around 2019-12-19
+pub const TESTNET_SECOND_HARD_FORK: u64 = 298_080;
+
+/// Testnet second hard fork height, set to happen around 2020-06-20
+pub const TESTNET_THIRD_HARD_FORK: u64 = 552_960;
+
+/// Testnet second hard fork height, set to happen around 2020-12-8
+pub const TESTNET_FOURTH_HARD_FORK: u64 = 642_240;
+
+/// Fork every 3 blocks
+pub const TESTING_HARD_FORK_INTERVAL: u64 = 3;
+
+/// Compute possible block version at a given height, implements
 /// 6 months interval scheduled hard forks for the first 2 years.
-pub fn valid_header_version(height: u64, version: HeaderVersion) -> bool {
-	let chain_type = global::CHAIN_TYPE.read().clone();
-	match chain_type {
-		global::ChainTypes::Floonet => {
-			if height < FLOONET_FIRST_HARD_FORK {
-				version == HeaderVersion::default()
-			// add branches one by one as we go from hard fork to hard fork
-			// } else if height < FLOONET_SECOND_HARD_FORK {
-			} else if height < 2 * HARD_FORK_INTERVAL {
-				version == HeaderVersion::new(2)
-			} else {
-				false
-			}
+pub fn header_version(height: u64) -> HeaderVersion {
+	let hf_interval = (1 + height / HARD_FORK_INTERVAL) as u16;
+	match global::get_chain_type() {
+		global::ChainTypes::Mainnet => HeaderVersion(min(5, hf_interval)),
+		global::ChainTypes::AutomatedTesting | global::ChainTypes::UserTesting => {
+			let testing_hf_interval = (1 + height / TESTING_HARD_FORK_INTERVAL) as u16;
+			HeaderVersion(min(5, testing_hf_interval))
 		}
-		// everything else just like mainnet
-		_ => {
-			if height < HARD_FORK_INTERVAL {
-				version == HeaderVersion::default()
-			} else if height < 2 * HARD_FORK_INTERVAL {
-				version == HeaderVersion::new(2)
-			// uncomment branches one by one as we go from hard fork to hard fork
-			/*} else if height < 3 * HARD_FORK_INTERVAL {
-				version == HeaderVersion::new(3)
-			} else if height < 4 * HARD_FORK_INTERVAL {
-				version == HeaderVersion::new(4)
+		global::ChainTypes::Testnet => {
+			if height < TESTNET_FIRST_HARD_FORK {
+				HeaderVersion(1)
+			} else if height < TESTNET_SECOND_HARD_FORK {
+				HeaderVersion(2)
+			} else if height < TESTNET_THIRD_HARD_FORK {
+				HeaderVersion(3)
+			} else if height < TESTNET_FOURTH_HARD_FORK {
+				HeaderVersion(4)
 			} else {
-				version > HeaderVersion::new(4) */
-			} else {
-				false
+				HeaderVersion(5)
 			}
 		}
 	}
 }
 
-/// Number of blocks used to calculate difficulty adjustments
-pub const DIFFICULTY_ADJUST_WINDOW: u64 = HOUR_HEIGHT;
+/// Check whether the block version is valid at a given height, implements
+/// 6 months interval scheduled hard forks for the first 2 years.
+pub fn valid_header_version(height: u64, version: HeaderVersion) -> bool {
+	version == header_version(height)
+}
 
-/// Average time span of the difficulty adjustment window
-pub const BLOCK_TIME_WINDOW: u64 = DIFFICULTY_ADJUST_WINDOW * BLOCK_TIME_SEC;
+/// Number of blocks used to calculate difficulty adjustment by Damped Moving Average
+pub const DMA_WINDOW: u64 = HOUR_HEIGHT;
 
-/// Clamp factor to use for difficulty adjustment
+/// Difficulty adjustment half life (actually, 60s * number of 0s-blocks to raise diff by factor e) is 4 hours
+pub const WTEMA_HALF_LIFE: u64 = 4 * HOUR_SEC;
+
+/// Average time span of the DMA difficulty adjustment window
+pub const BLOCK_TIME_WINDOW: u64 = DMA_WINDOW * BLOCK_TIME_SEC;
+
+/// Clamp factor to use for DMA difficulty adjustment
 /// Limit value to within this factor of goal
 pub const CLAMP_FACTOR: u64 = 2;
 
-/// Dampening factor to use for difficulty adjustment
-pub const DIFFICULTY_DAMP_FACTOR: u64 = 3;
+/// Dampening factor to use for DMA difficulty adjustment
+pub const DMA_DAMP_FACTOR: u64 = 3;
 
 /// Dampening factor to use for AR scale calculation.
 pub const AR_SCALE_DAMP_FACTOR: u64 = 13;
 
 /// Compute weight of a graph as number of siphash bits defining the graph
-/// Must be made dependent on height to phase out C31 in early 2020
-/// Later phase outs are on hold for now
+/// The height dependence allows a 30-week linear transition from C31+ to C32+ starting after 1 year
 pub fn graph_weight(height: u64, edge_bits: u8) -> u64 {
 	let mut xpr_edge_bits = edge_bits as u64;
 
-	let bits_over_min = edge_bits.saturating_sub(global::min_edge_bits());
-	let expiry_height = (1 << bits_over_min) * YEAR_HEIGHT;
-	if edge_bits < 32 && height >= expiry_height {
+	let expiry_height = YEAR_HEIGHT;
+	if edge_bits == 31 && height >= expiry_height {
 		xpr_edge_bits = xpr_edge_bits.saturating_sub(1 + (height - expiry_height) / WEEK_HEIGHT);
 	}
+	// For C31 xpr_edge_bits reaches 0 at height YEAR_HEIGHT + 30 * WEEK_HEIGHT
+	// 30 weeks after Jan 15, 2020 would be Aug 12, 2020
 
-	(2 << (edge_bits - global::base_edge_bits()) as u64) * xpr_edge_bits
+	(2u64 << (edge_bits - global::base_edge_bits()) as u64) * xpr_edge_bits
 }
 
-/// Minimum difficulty, enforced in diff retargetting
+/// minimum solution difficulty after HardFork4 when PoW becomes primary only Cuckatoo32+
+pub const C32_GRAPH_WEIGHT: u64 = (2u64 << (32 - BASE_EDGE_BITS) as u64) * 32; // 16384
+
+/// Minimum difficulty, enforced in Damped Moving Average diff retargetting
 /// avoids getting stuck when trying to increase difficulty subject to dampening
-pub const MIN_DIFFICULTY: u64 = DIFFICULTY_DAMP_FACTOR;
+pub const MIN_DMA_DIFFICULTY: u64 = DMA_DAMP_FACTOR;
 
 /// Minimum scaling factor for AR pow, enforced in diff retargetting
 /// avoids getting stuck when trying to increase ar_scale subject to dampening
@@ -219,6 +230,8 @@ pub const INITIAL_DIFFICULTY: u64 = 1_000_000 * UNIT_DIFFICULTY;
 /// take place
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderInfo {
+	/// Block hash, ZERO_HASH when this is a sythetic entry.
+	pub block_hash: Hash,
 	/// Timestamp of the header, 1 when not used (returned info)
 	pub timestamp: u64,
 	/// Network difficulty or next difficulty to use
@@ -232,12 +245,14 @@ pub struct HeaderInfo {
 impl HeaderInfo {
 	/// Default constructor
 	pub fn new(
+		block_hash: Hash,
 		timestamp: u64,
 		difficulty: Difficulty,
 		secondary_scaling: u32,
 		is_secondary: bool,
 	) -> HeaderInfo {
 		HeaderInfo {
+			block_hash,
 			timestamp,
 			difficulty,
 			secondary_scaling,
@@ -249,6 +264,7 @@ impl HeaderInfo {
 	/// PoW factor
 	pub fn from_ts_diff(timestamp: u64, difficulty: Difficulty) -> HeaderInfo {
 		HeaderInfo {
+			block_hash: ZERO_HASH,
 			timestamp,
 			difficulty,
 			secondary_scaling: global::initial_graph_weight(),
@@ -261,6 +277,7 @@ impl HeaderInfo {
 	/// timestamp
 	pub fn from_diff_scaling(difficulty: Difficulty, secondary_scaling: u32) -> HeaderInfo {
 		HeaderInfo {
+			block_hash: ZERO_HASH,
 			timestamp: 1,
 			difficulty,
 			secondary_scaling,
@@ -279,37 +296,43 @@ pub fn clamp(actual: u64, goal: u64, clamp_factor: u64) -> u64 {
 	max(goal / clamp_factor, min(actual, goal * clamp_factor))
 }
 
-/// Computes the proof-of-work difficulty that the next block should comply
-/// with. Takes an iterator over past block headers information, from latest
+/// Computes the proof-of-work difficulty that the next block should comply with.
+/// Takes an iterator over past block headers information, from latest
 /// (highest height) to oldest (lowest height).
-///
-/// The difficulty calculation is based on both Digishield and GravityWave
-/// family of difficulty computation, coming to something very close to Zcash.
-/// The reference difficulty is an average of the difficulty over a window of
-/// DIFFICULTY_ADJUST_WINDOW blocks. The corresponding timespan is calculated
-/// by using the difference between the median timestamps at the beginning
-/// and the end of the window.
-///
-/// The secondary proof-of-work factor is calculated along the same lines, as
-/// an adjustment on the deviation against the ideal value.
+/// Uses either the old dma DAA or, starting from HF4, the new wtema DAA
 pub fn next_difficulty<T>(height: u64, cursor: T) -> HeaderInfo
+where
+	T: IntoIterator<Item = HeaderInfo>,
+{
+	if header_version(height) < HeaderVersion(5) {
+		next_dma_difficulty(height, cursor)
+	} else {
+		next_wtema_difficulty(height, cursor)
+	}
+}
+
+/// Difficulty calculation based on a Damped Moving Average
+/// of difficulty over a window of DMA_WINDOW blocks.
+/// The corresponding timespan is calculated
+/// by using the difference between the timestamps at the beginning
+/// and the end of the window, with a damping toward the target block time.
+pub fn next_dma_difficulty<T>(height: u64, cursor: T) -> HeaderInfo
 where
 	T: IntoIterator<Item = HeaderInfo>,
 {
 	// Create vector of difficulty data running from earliest
 	// to latest, and pad with simulated pre-genesis data to allow earlier
 	// adjustment if there isn't enough window data length will be
-	// DIFFICULTY_ADJUST_WINDOW + 1 (for initial block time bound)
+	// DMA_WINDOW + 1 (for initial block time bound)
 	let diff_data = global::difficulty_data_to_vector(cursor);
 
 	// First, get the ratio of secondary PoW vs primary, skipping initial header
 	let sec_pow_scaling = secondary_pow_scaling(height, &diff_data[1..]);
 
 	// Get the timestamp delta across the window
-	let ts_delta: u64 =
-		diff_data[DIFFICULTY_ADJUST_WINDOW as usize].timestamp - diff_data[0].timestamp;
+	let ts_delta: u64 = diff_data[DMA_WINDOW as usize].timestamp - diff_data[0].timestamp;
 
-	// Get the difficulty sum of the last DIFFICULTY_ADJUST_WINDOW elements
+	// Get the difficulty sum of the last DMA_WINDOW elements
 	let diff_sum: u64 = diff_data
 		.iter()
 		.skip(1)
@@ -318,14 +341,41 @@ where
 
 	// adjust time delta toward goal subject to dampening and clamping
 	let adj_ts = clamp(
-		damp(ts_delta, BLOCK_TIME_WINDOW, DIFFICULTY_DAMP_FACTOR),
+		damp(ts_delta, BLOCK_TIME_WINDOW, DMA_DAMP_FACTOR),
 		BLOCK_TIME_WINDOW,
 		CLAMP_FACTOR,
 	);
 	// minimum difficulty avoids getting stuck due to dampening
-	let difficulty = max(MIN_DIFFICULTY, diff_sum * BLOCK_TIME_SEC / adj_ts);
+	let difficulty = max(MIN_DMA_DIFFICULTY, diff_sum * BLOCK_TIME_SEC / adj_ts);
 
 	HeaderInfo::from_diff_scaling(Difficulty::from_num(difficulty), sec_pow_scaling)
+}
+
+/// Difficulty calculation based on a Weighted Target Exponential Moving Average
+/// of difficulty, using the ratio of the last block time over the target block time.
+pub fn next_wtema_difficulty<T>(_height: u64, cursor: T) -> HeaderInfo
+where
+	T: IntoIterator<Item = HeaderInfo>,
+{
+	let mut last_headers = cursor.into_iter();
+
+	// last two headers
+	let last_header = last_headers.next().unwrap();
+	let prev_header = last_headers.next().unwrap();
+
+	let last_block_time: u64 = last_header.timestamp - prev_header.timestamp;
+
+	let last_diff = last_header.difficulty.to_num();
+
+	// wtema difficulty update
+	let next_diff =
+		last_diff * WTEMA_HALF_LIFE / (WTEMA_HALF_LIFE - BLOCK_TIME_SEC + last_block_time);
+
+	// mainnet minimum difficulty at graph_weight(32) ensures difficulty increase on 59s block
+	// since 16384 * WTEMA_HALF_LIFE / (WTEMA_HALF_LIFE - 1) > 16384
+	let difficulty = max(Difficulty::min_wtema(), Difficulty::from_num(next_diff));
+
+	HeaderInfo::from_diff_scaling(difficulty, 0) // no more secondary PoW
 }
 
 /// Count, in units of 1/100 (a percent), the number of "secondary" (AR) blocks in the provided window of blocks.
@@ -333,14 +383,16 @@ pub fn ar_count(_height: u64, diff_data: &[HeaderInfo]) -> u64 {
 	100 * diff_data.iter().filter(|n| n.is_secondary).count() as u64
 }
 
+/// The secondary proof-of-work factor is calculated along the same lines as in next_dma_difficulty,
+/// as an adjustment on the deviation against the ideal value.
 /// Factor by which the secondary proof of work difficulty will be adjusted
 pub fn secondary_pow_scaling(height: u64, diff_data: &[HeaderInfo]) -> u32 {
-	// Get the scaling factor sum of the last DIFFICULTY_ADJUST_WINDOW elements
+	// Get the scaling factor sum of the last DMA_WINDOW elements
 	let scale_sum: u64 = diff_data.iter().map(|dd| dd.secondary_scaling as u64).sum();
 
 	// compute ideal 2nd_pow_fraction in pct and across window
 	let target_pct = secondary_pow_ratio(height);
-	let target_count = DIFFICULTY_ADJUST_WINDOW * target_pct;
+	let target_count = DMA_WINDOW * target_pct;
 
 	// Get the secondary count across the window, adjusting count toward goal
 	// subject to dampening and clamping.
@@ -348,7 +400,7 @@ pub fn secondary_pow_scaling(height: u64, diff_data: &[HeaderInfo]) -> u32 {
 		damp(
 			ar_count(height, diff_data),
 			target_count,
-			ar_scale_damp_factor(height),
+			AR_SCALE_DAMP_FACTOR,
 		),
 		target_count,
 		CLAMP_FACTOR,
@@ -365,6 +417,8 @@ mod test {
 
 	#[test]
 	fn test_graph_weight() {
+		global::set_local_chain_type(global::ChainTypes::Mainnet);
+
 		// initial weights
 		assert_eq!(graph_weight(1, 31), 256 * 31);
 		assert_eq!(graph_weight(1, 32), 512 * 32);
@@ -386,15 +440,18 @@ mod test {
 		assert_eq!(graph_weight(2 * YEAR_HEIGHT, 33), 1024 * 33);
 
 		// 32 phaseout on hold
-		assert_eq!(graph_weight(2 * YEAR_HEIGHT + WEEK_HEIGHT, 32), 512 * 32);
+		assert_eq!(
+			graph_weight(2 * YEAR_HEIGHT + WEEK_HEIGHT, 32),
+			C32_GRAPH_WEIGHT
+		);
 		assert_eq!(graph_weight(2 * YEAR_HEIGHT + WEEK_HEIGHT, 31), 0);
 		assert_eq!(
 			graph_weight(2 * YEAR_HEIGHT + 30 * WEEK_HEIGHT, 32),
-			512 * 32
+			C32_GRAPH_WEIGHT
 		);
 		assert_eq!(
 			graph_weight(2 * YEAR_HEIGHT + 31 * WEEK_HEIGHT, 32),
-			512 * 32
+			C32_GRAPH_WEIGHT
 		);
 
 		// 3 years in, nothing changes
@@ -405,6 +462,7 @@ mod test {
 		// 4 years in, still on hold
 		assert_eq!(graph_weight(4 * YEAR_HEIGHT, 31), 0);
 		assert_eq!(graph_weight(4 * YEAR_HEIGHT, 32), 512 * 32);
+		assert_eq!(graph_weight(4 * YEAR_HEIGHT, 33), 1024 * 33);
 		assert_eq!(graph_weight(4 * YEAR_HEIGHT, 33), 1024 * 33);
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,15 +19,15 @@ use crate::util::RwLock;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::core::consensus::graph_weight;
 use crate::core::core::hash::Hash;
 use crate::core::ser::ProtocolVersion;
 
 use chrono::prelude::*;
 
-use crate::chain;
 use crate::chain::SyncStatus;
 use crate::p2p;
+use crate::p2p::Capabilities;
+use grin_core::pow::Difficulty;
 
 /// Server state info collection struct, to be passed around into internals
 /// and populated when required
@@ -51,9 +51,9 @@ pub struct ServerStats {
 	/// Number of peers
 	pub peer_count: u32,
 	/// Chain head
-	pub head: chain::Tip,
-	/// sync header head
-	pub header_head: chain::Tip,
+	pub chain_stats: ChainStats,
+	/// Header head (may differ from chain head)
+	pub header_stats: ChainStats,
 	/// Whether we're currently syncing
 	pub sync_status: SyncStatus,
 	/// Handle to current stratum server stats
@@ -62,8 +62,36 @@ pub struct ServerStats {
 	pub peer_stats: Vec<PeerStats>,
 	/// Difficulty calculation statistics
 	pub diff_stats: DiffStats,
+	/// Transaction pool statistics
+	pub tx_stats: Option<TxStats>,
+	/// Disk usage in GB
+	pub disk_usage_gb: String,
 }
 
+/// Chain Statistics
+#[derive(Clone, Serialize, Debug)]
+pub struct ChainStats {
+	/// Height of the tip (max height of the fork)
+	pub height: u64,
+	/// Last block pushed to the fork
+	pub last_block_h: Hash,
+	/// Total difficulty accumulated on that fork
+	pub total_difficulty: Difficulty,
+	/// Timestamp of highest block or header
+	pub latest_timestamp: DateTime<Utc>,
+}
+/// Transaction Statistics
+#[derive(Clone, Serialize, Debug)]
+pub struct TxStats {
+	/// Number of transactions in the transaction pool
+	pub tx_pool_size: usize,
+	/// Number of transaction kernels in the transaction pool
+	pub tx_pool_kernels: usize,
+	/// Number of transactions in the stem pool
+	pub stem_pool_size: usize,
+	/// Number of transaction kernels in the stem pool
+	pub stem_pool_kernels: usize,
+}
 /// Struct to return relevant information about stratum workers
 #[derive(Clone, Serialize, Debug)]
 pub struct WorkerStats {
@@ -100,8 +128,10 @@ pub struct StratumStats {
 	pub block_height: u64,
 	/// current network difficulty we're working on
 	pub network_difficulty: u64,
-	/// cuckoo size used for mining
+	/// cuckoo size of last share submitted
 	pub edge_bits: u16,
+	/// current network Hashrate (for edge_bits)
+	pub network_hashrate: f64,
 	/// Individual worker status
 	pub worker_stats: Vec<WorkerStats>,
 }
@@ -163,13 +193,25 @@ pub struct PeerStats {
 	pub sent_bytes_per_sec: u64,
 	/// Number of bytes we've received from the peer.
 	pub received_bytes_per_sec: u64,
+	/// Peer advertised capability flags.
+	pub capabilities: Capabilities,
 }
 
-impl StratumStats {
-	/// Calculate network hashrate
-	pub fn network_hashrate(&self, height: u64) -> f64 {
-		42.0 * (self.network_difficulty as f64 / graph_weight(height, self.edge_bits as u8) as f64)
-			/ 60.0
+impl PartialEq for PeerStats {
+	fn eq(&self, other: &PeerStats) -> bool {
+		*self.addr == other.addr
+	}
+}
+
+impl PartialEq for WorkerStats {
+	fn eq(&self, other: &WorkerStats) -> bool {
+		*self.id == other.id
+	}
+}
+
+impl PartialEq for DiffBlock {
+	fn eq(&self, other: &DiffBlock) -> bool {
+		self.block_height == other.block_height
 	}
 }
 
@@ -177,13 +219,13 @@ impl PeerStats {
 	/// Convert from a peer directly
 	pub fn from_peer(peer: &p2p::Peer) -> PeerStats {
 		// State
-		let mut state = "Disconnected";
-		if peer.is_connected() {
-			state = "Connected";
-		}
-		if peer.is_banned() {
-			state = "Banned";
-		}
+		let state = if peer.is_banned() {
+			"Banned"
+		} else if peer.is_connected() {
+			"Connected"
+		} else {
+			"Disconnected"
+		};
 		let addr = peer.info.addr.to_string();
 		let direction = match peer.info.direction {
 			p2p::types::Direction::Inbound => "Inbound",
@@ -198,8 +240,9 @@ impl PeerStats {
 			height: peer.info.height(),
 			direction: direction.to_string(),
 			last_seen: peer.info.last_seen(),
-			sent_bytes_per_sec: peer.last_min_sent_bytes().unwrap_or(0) / 60,
-			received_bytes_per_sec: peer.last_min_received_bytes().unwrap_or(0) / 60,
+			sent_bytes_per_sec: peer.tracker().sent_bytes.read().bytes_per_min() / 60,
+			received_bytes_per_sec: peer.tracker().received_bytes.read().bytes_per_min() / 60,
+			capabilities: peer.info.capabilities,
 		}
 	}
 }
@@ -227,8 +270,9 @@ impl Default for StratumStats {
 			is_running: false,
 			num_workers: 0,
 			block_height: 0,
-			network_difficulty: 1000,
-			edge_bits: 29,
+			network_difficulty: 0,
+			edge_bits: 0,
+			network_hashrate: 0.0,
 			worker_stats: Vec::new(),
 		}
 	}

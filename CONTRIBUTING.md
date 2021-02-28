@@ -17,7 +17,7 @@ Since mainnet has been released, the bar for having PRs accepted has been raised
 * Explains whether/how the change is consensus breaking or breaks existing client functionality
 * Contains unit tests exercising new/changed functionality
 * Fully considers the potential impact of the change on other parts of the system
-* Describes how you've tested the change (e.g. against Floonet, etc)
+* Describes how you've tested the change (e.g. against Testnet, etc)
 * Updates any documentation that's affected by the PR
 
 If submitting a PR consisting of documentation changes only, please try to ensure that the change is significantly more substantial than one or two lines. For example, working through an install document and making changes and updates throughout as you find issues is worth a PR. For typos and other small changes, either contact one of the developers, or if you think it's a significant enough error to cause problems for other users, please feel free to open an issue.
@@ -34,7 +34,7 @@ In case of problems with trying out grin, before starting to contribute, there's
 * And [see the developers chat](https://gitter.im/grin_community/dev) if you have questions about source code files.
   If you explain what you're looking at and what you want to do, we'll try to help you along the way.
 * Also see `docs/*.md` and the folder structure explanations, and [the wiki](https://github.com/mimblewimble/docs/wiki).
-* Further information and discussions are in the [Forum](https://www.grin-forum.org/), the [website](https://grin-tech.org), the [mailing list](https://lists.launchpad.net/mimblewimble/) and news channels like the [@grincouncil](https://twitter.com/grincouncil) and a (mostly unfiltered!) Twitter bot that collects headlines, mailing list posts, and reddit posts related to MimbleWimble/Grin: [@grinmw](https://twitter.com/grinmw)
+* Further information and discussions are in the [Forum](https://forum.grin.mw), the [website](https://grin.mw), the [mailing list](https://lists.launchpad.net/mimblewimble/) and news channels like the [@grincouncil](https://twitter.com/grincouncil) and a (mostly unfiltered!) Twitter bot that collects headlines, mailing list posts, and reddit posts related to Mimblewimble/Grin: [@grinmw](https://twitter.com/grinmw)
 
 ## Testing
 

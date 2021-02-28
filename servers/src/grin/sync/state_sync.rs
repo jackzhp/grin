@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,8 @@ use std::sync::Arc;
 use crate::chain::{self, SyncState, SyncStatus};
 use crate::core::core::hash::Hashed;
 use crate::core::global;
-use crate::p2p::{self, Peer};
+use crate::core::pow::Difficulty;
+use crate::p2p::{self, Capabilities, Peer};
 
 /// Fast sync has 3 "states":
 /// * syncing headers
@@ -68,13 +69,9 @@ impl StateSync {
 		let mut sync_need_restart = false;
 
 		// check sync error
-		{
-			let clone = self.sync_state.sync_error();
-			if let Some(ref sync_error) = *clone.read() {
-				error!("state_sync: error = {:?}. restart fast sync", sync_error);
-				sync_need_restart = true;
-			}
-			drop(clone);
+		if let Some(sync_error) = self.sync_state.sync_error() {
+			error!("state_sync: error = {}. restart fast sync", sync_error);
+			sync_need_restart = true;
 		}
 
 		// check peer connection status of this sync
@@ -92,15 +89,16 @@ impl StateSync {
 
 		// if txhashset downloaded and validated successfully, we switch to BodySync state,
 		// and we need call state_sync_reset() to make it ready for next possible state sync.
-		let done = if let SyncStatus::TxHashsetDone = self.sync_state.status() {
-			self.sync_state.update(SyncStatus::BodySync {
+		let done = self.sync_state.update_if(
+			SyncStatus::BodySync {
 				current_height: 0,
 				highest_height: 0,
-			});
-			true
-		} else {
-			false
-		};
+			},
+			|s| match s {
+				SyncStatus::TxHashsetDone => true,
+				_ => false,
+			},
+		);
 
 		if sync_need_restart || done {
 			self.state_sync_reset();
@@ -137,24 +135,19 @@ impl StateSync {
 
 				// to avoid the confusing log,
 				// update the final HeaderSync state mainly for 'current_height'
-				{
-					let status = self.sync_state.status();
-					if let SyncStatus::HeaderSync { .. } = status {
-						self.sync_state.update(SyncStatus::HeaderSync {
-							current_height: header_head.height,
-							highest_height,
-						});
-					}
-				}
+				self.sync_state.update_if(
+					SyncStatus::HeaderSync {
+						current_height: header_head.height,
+						highest_height,
+					},
+					|s| match s {
+						SyncStatus::HeaderSync { .. } => true,
+						_ => false,
+					},
+				);
 
-				self.sync_state.update(SyncStatus::TxHashsetDownload {
-					start_time: Utc::now(),
-					prev_update_time: Utc::now(),
-					update_time: Utc::now(),
-					prev_downloaded_size: 0,
-					downloaded_size: 0,
-					total_size: 0,
-				});
+				self.sync_state
+					.update(SyncStatus::TxHashsetDownload(Default::default()));
 			}
 		}
 		true
@@ -166,7 +159,24 @@ impl StateSync {
 		let mut txhashset_height = header_head.height.saturating_sub(threshold);
 		txhashset_height = txhashset_height.saturating_sub(txhashset_height % archive_interval);
 
-		if let Some(peer) = self.peers.most_work_peer() {
+		let peers_iter = || {
+			self.peers
+				.iter()
+				.with_capabilities(Capabilities::TXHASHSET_HIST)
+				.connected()
+		};
+
+		// Filter peers further based on max difficulty.
+		let max_diff = peers_iter().max_difficulty().unwrap_or(Difficulty::zero());
+		let peers_iter = || peers_iter().with_difficulty(|x| x >= max_diff);
+
+		// Choose a random "most work" peer, preferring outbound if at all possible.
+		let peer = peers_iter().outbound().choose_random().or_else(|| {
+			warn!("no suitable outbound peer for state sync, considering inbound");
+			peers_iter().inbound().choose_random()
+		});
+
+		if let Some(peer) = peer {
 			// ask for txhashset at state_sync_threshold
 			let mut txhashset_head = self
 				.chain
@@ -203,7 +213,7 @@ impl StateSync {
 				error!("state_sync: send_txhashset_request err! {:?}", e);
 				return Err(e);
 			}
-			return Ok(peer.clone());
+			return Ok(peer);
 		}
 		Err(p2p::Error::PeerException)
 	}

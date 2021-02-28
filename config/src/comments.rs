@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,7 +56,16 @@ fn comments() -> HashMap<String, String> {
 	retval.insert(
 		"api_secret_path".to_string(),
 		"
-#path of the secret token used by the API to authenticate the calls
+#path of the secret token used by the Rest API and v2 Owner API to authenticate the calls
+#comment the it to disable basic auth
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"foreign_api_secret_path".to_string(),
+		"
+#path of the secret token used by the Foreign API to authenticate the calls
 #comment the it to disable basic auth
 "
 		.to_string(),
@@ -78,8 +87,21 @@ fn comments() -> HashMap<String, String> {
 #parameters used for mining as well as wallet output coinbase maturity. Can be:
 #AutomatedTesting - For CI builds and instant blockchain creation
 #UserTesting - For regular user testing (cuckoo 16)
-#Floonet - For the long term floonet test network
+#Testnet - For the long term test network
 #Mainnet - For mainnet
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"future_time_limit".to_string(),
+		"
+#The Future Time Limit (FTL) is a limit on how far into the future,
+#relative to a node's local time, the timestamp on a new block can be,
+#in order for the block to be accepted.
+#At Hard Fork 4, this was reduced from 12 minutes down to 5 minutes,
+#so as to limit possible timestamp manipulation on the new
+#wtema difficulty adjustment algorithm
 "
 		.to_string(),
 	);
@@ -114,8 +136,7 @@ fn comments() -> HashMap<String, String> {
 	retval.insert(
 		"run_tui".to_string(),
 		"
-#whether to run the ncurses TUI. Ncurses must be installed and this
-#will also disable logging to stdout
+#whether to run the ncurses TUI (Ncurses must be installed)
 "
 		.to_string(),
 	);
@@ -252,13 +273,14 @@ fn comments() -> HashMap<String, String> {
 	retval.insert(
 		"seeding_type".to_string(),
 		"
+#All seeds/peers can be either IP address or DNS names. Port number must always be specified
 #how to seed this server, can be None, List or DNSSeed
 "
 		.to_string(),
 	);
 
 	retval.insert(
-		"[server.p2p_config.capabilities]".to_string(),
+		"[server.pool_config]".to_string(),
 		"#If the seeding type is List, the list of peers to connect to can
 #be specified as follows:
 #seeds = [\"192.168.0.1:3414\",\"192.168.0.2:3414\"]
@@ -274,26 +296,22 @@ fn comments() -> HashMap<String, String> {
 #how long a banned peer should stay banned
 #ban_window = 10800
 
-#maximum number of peers
-#peer_max_count = 125
+#maximum number of inbound peer connections
+#peer_max_inbound_count = 128
 
-#preferred minimum number of peers (we'll actively keep trying to add peers
-#until we get to at least this number
-#peer_min_preferred_count = 8
+#maximum number of outbound peer connections
+#peer_max_outbound_count = 8
 
-# 15 = Bit flags for FULL_NODE
-#This structure needs to be changed internally, to make it more configurable
+#preferred minimum number of outbound peers (we'll actively keep trying to add peers
+#until we get to at least this number)
+#peer_min_preferred_outbound_count = 8
+
+#amount of incoming connections temporarily allowed to exceed peer_max_inbound_count
+#peer_listener_buffer_count = 8
 
 # A preferred dandelion_peer, mainly used for testing dandelion
 # dandelion_peer = \"10.0.0.1:13144\"
 
-"
-		.to_string(),
-	);
-
-	retval.insert(
-		"[server.pool_config]".to_string(),
-		"
 #########################################
 ### MEMPOOL CONFIGURATION             ###
 #########################################
@@ -305,6 +323,16 @@ fn comments() -> HashMap<String, String> {
 		"accept_fee_base".to_string(),
 		"
 #base fee that's accepted into the pool
+#a setting to 1000000 will be overridden to 500000 to respect the fixfees RFC
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"reorg_cache_period".to_string(),
+		"
+#reorg cache retention period in minute.
+#the reorg cache repopulates local mempool in a reorg scenario.
 "
 		.to_string(),
 	);
@@ -471,10 +499,10 @@ fn comments() -> HashMap<String, String> {
 }
 
 fn get_key(line: &str) -> String {
-	if line.contains("[") && line.contains("]") {
+	if line.contains('[') && line.contains(']') {
 		return line.to_owned();
-	} else if line.contains("=") {
-		return line.split("=").collect::<Vec<&str>>()[0].trim().to_owned();
+	} else if line.contains('=') {
+		return line.split('=').collect::<Vec<&str>>()[0].trim().to_owned();
 	} else {
 		return "NOT_FOUND".to_owned();
 	}
@@ -482,7 +510,7 @@ fn get_key(line: &str) -> String {
 
 pub fn insert_comments(orig: String) -> String {
 	let comments = comments();
-	let lines: Vec<&str> = orig.split("\n").collect();
+	let lines: Vec<&str> = orig.split('\n').collect();
 	let mut out_lines = vec![];
 	for l in lines {
 		let key = get_key(l);
@@ -496,5 +524,5 @@ pub fn insert_comments(orig: String) -> String {
 	for l in out_lines {
 		ret_val.push_str(&l);
 	}
-	ret_val.to_owned()
+	ret_val
 }

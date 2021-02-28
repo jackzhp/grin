@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,8 +28,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
 // Re-export so only has to be included once
-pub use parking_lot::Mutex;
-pub use parking_lot::{RwLock, RwLockReadGuard};
+pub use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // Re-export so only has to be included once
 pub use secp256k1zkp as secp;
@@ -43,7 +42,7 @@ pub mod secp_static;
 pub use crate::secp_static::static_secp_instance;
 
 pub mod types;
-pub use crate::types::{LogLevel, LoggingConfig, ZeroingString};
+pub use crate::types::ZeroingString;
 
 pub mod macros;
 
@@ -99,6 +98,11 @@ where
 		inner
 			.clone()
 			.expect("Cannot borrow one_time before initialization.")
+	}
+
+	/// Has this OneTime been initialized?
+	pub fn is_init(&self) -> bool {
+		self.inner.read().is_some()
 	}
 }
 

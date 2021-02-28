@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::conn::Tracker;
 use crate::core::core::hash::Hash;
 use crate::core::pow::Difficulty;
 use crate::core::ser::ProtocolVersion;
-use crate::msg::{read_message, write_message, Hand, Shake, Type, USER_AGENT};
+use crate::msg::{read_message, write_message, Hand, Msg, Shake, Type, USER_AGENT};
 use crate::peer::Peer;
 use crate::types::{Capabilities, Direction, Error, P2PConfig, PeerAddr, PeerInfo, PeerLiveInfo};
 use crate::util::RwLock;
@@ -23,6 +24,7 @@ use rand::{thread_rng, Rng};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Local generated nonce for peer connecting.
 /// Used for self-connecting detection (on receiver side),
@@ -32,6 +34,21 @@ const NONCES_CAP: usize = 100;
 /// Used in connecting request to avoid self-connecting request,
 /// 10 should be enough since most of servers don't have more than 10 IP addresses.
 const ADDRS_CAP: usize = 10;
+
+/// The initial Hand message should come in immediately after the connection is initiated.
+/// But for consistency use the same timeout for reading both Hand and Shake messages.
+const HAND_READ_TIMEOUT: Duration = Duration::from_millis(10_000);
+
+/// We need to allow time for the peer to receive our Hand message and send back a Shake reply.
+const SHAKE_READ_TIMEOUT: Duration = Duration::from_millis(10_000);
+
+/// Fail fast when trying to write a Hand message to the tcp stream.
+/// If we cannot write it within a couple of seconds then something has likely gone wrong.
+const HAND_WRITE_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// Fail fast when trying to write a Shake message to the tcp stream.
+/// If we cannot write it within a couple of seconds then something has likely gone wrong.
+const SHAKE_WRITE_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 /// Handles the handshake negotiation when two peers connect and decides on
 /// protocol.
@@ -46,6 +63,8 @@ pub struct Handshake {
 	/// ok).
 	genesis: Hash,
 	config: P2PConfig,
+	protocol_version: ProtocolVersion,
+	tracker: Arc<Tracker>,
 }
 
 impl Handshake {
@@ -56,7 +75,21 @@ impl Handshake {
 			addrs: Arc::new(RwLock::new(VecDeque::with_capacity(ADDRS_CAP))),
 			genesis,
 			config,
+			protocol_version: ProtocolVersion::local(),
+			tracker: Arc::new(Tracker::new()),
 		}
+	}
+
+	/// Select a protocol version here that we know is supported by both us and the remote peer.
+	///
+	/// Current strategy is to simply use `min(local, remote)`.
+	///
+	/// We can enforce "minimum" protocol version here in the future
+	/// by raising an error and forcing the connection to close.
+	///
+	fn negotiate_protocol_version(&self, other: ProtocolVersion) -> Result<ProtocolVersion, Error> {
+		let version = std::cmp::min(self.protocol_version, other);
+		Ok(version)
 	}
 
 	pub fn initiate(
@@ -66,6 +99,12 @@ impl Handshake {
 		self_addr: PeerAddr,
 		conn: &mut TcpStream,
 	) -> Result<PeerInfo, Error> {
+		// Set explicit timeouts on the tcp stream for hand/shake messages.
+		// Once the peer is up and running we will set new values for these.
+		// We initiate this connection, writing a Hand message and read a Shake reply.
+		let _ = conn.set_write_timeout(Some(HAND_WRITE_TIMEOUT));
+		let _ = conn.set_read_timeout(Some(SHAKE_READ_TIMEOUT));
+
 		// prepare the first part of the handshake
 		let nonce = self.next_nonce();
 		let peer_addr = match conn.peer_addr() {
@@ -73,11 +112,8 @@ impl Handshake {
 			Err(e) => return Err(Error::Connection(e)),
 		};
 
-		// Using our default "local" protocol version.
-		let version = ProtocolVersion::local();
-
 		let hand = Hand {
-			version,
+			version: self.protocol_version,
 			capabilities,
 			nonce,
 			genesis: self.genesis,
@@ -88,22 +124,24 @@ impl Handshake {
 		};
 
 		// write and read the handshake response
-		write_message(conn, hand, Type::Hand, version)?;
+		let msg = Msg::new(Type::Hand, hand, self.protocol_version)?;
+		write_message(conn, &msg, self.tracker.clone())?;
 
-		// Note: We have to read the Shake message *before* we know which protocol
-		// version our peer supports (it is in the shake message itself).
-		let shake: Shake = read_message(conn, version, Type::Shake)?;
+		let shake: Shake = read_message(conn, self.protocol_version, Type::Shake)?;
 		if shake.genesis != self.genesis {
 			return Err(Error::GenesisMismatch {
 				us: self.genesis,
 				peer: shake.genesis,
 			});
 		}
+
+		let negotiated_version = self.negotiate_protocol_version(shake.version)?;
+
 		let peer_info = PeerInfo {
 			capabilities: shake.capabilities,
 			user_agent: shake.user_agent,
 			addr: peer_addr,
-			version: shake.version,
+			version: negotiated_version,
 			live_info: Arc::new(RwLock::new(PeerLiveInfo::new(shake.total_difficulty))),
 			direction: Direction::Outbound,
 		};
@@ -115,11 +153,12 @@ impl Handshake {
 		}
 
 		debug!(
-			"Connected! Cumulative {} offered from {:?} {:?} {:?}",
+			"Connected! Cumulative {} offered from {:?}, {:?}, {:?}, {:?}",
 			shake.total_difficulty.to_num(),
 			peer_info.addr,
+			peer_info.version,
 			peer_info.user_agent,
-			peer_info.capabilities
+			peer_info.capabilities,
 		);
 		// when more than one protocol version is supported, choosing should go here
 		Ok(peer_info)
@@ -131,11 +170,13 @@ impl Handshake {
 		total_difficulty: Difficulty,
 		conn: &mut TcpStream,
 	) -> Result<PeerInfo, Error> {
-		// Note: We read the Hand message *before* we know which protocol version
-		// is supported by our peer (in the Hand message).
-		let version = ProtocolVersion::local();
+		// Set explicit timeouts on the tcp stream for hand/shake messages.
+		// Once the peer is up and running we will set new values for these.
+		// We accept an inbound connection, reading a Hand then writing a Shake reply.
+		let _ = conn.set_read_timeout(Some(HAND_READ_TIMEOUT));
+		let _ = conn.set_write_timeout(Some(SHAKE_WRITE_TIMEOUT));
 
-		let hand: Hand = read_message(conn, version, Type::Hand)?;
+		let hand: Hand = read_message(conn, self.protocol_version, Type::Hand)?;
 
 		// all the reasons we could refuse this connection for
 		if hand.genesis != self.genesis {
@@ -158,12 +199,14 @@ impl Handshake {
 			}
 		}
 
+		let negotiated_version = self.negotiate_protocol_version(hand.version)?;
+
 		// all good, keep peer info
 		let peer_info = PeerInfo {
 			capabilities: hand.capabilities,
 			user_agent: hand.user_agent,
 			addr: resolve_peer_addr(hand.sender_addr, &conn),
-			version: hand.version,
+			version: negotiated_version,
 			live_info: Arc::new(RwLock::new(PeerLiveInfo::new(hand.total_difficulty))),
 			direction: Direction::Inbound,
 		};
@@ -178,14 +221,16 @@ impl Handshake {
 
 		// send our reply with our info
 		let shake = Shake {
-			version,
+			version: self.protocol_version,
 			capabilities: capab,
 			genesis: self.genesis,
 			total_difficulty: total_difficulty,
 			user_agent: USER_AGENT.to_string(),
 		};
 
-		write_message(conn, shake, Type::Shake, version)?;
+		let msg = Msg::new(Type::Shake, shake, negotiated_version)?;
+		write_message(conn, &msg, self.tracker.clone())?;
+
 		trace!("Success handshake with {}.", peer_info.addr);
 
 		Ok(peer_info)

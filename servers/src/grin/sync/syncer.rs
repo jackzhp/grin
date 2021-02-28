@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -79,14 +79,22 @@ impl SyncRunner {
 			if self.stop_state.is_stopped() {
 				break;
 			}
-			let wp = self.peers.more_or_same_work_peers()?;
+			// Count peers with at least our difficulty.
+			let wp = self
+				.peers
+				.iter()
+				.outbound()
+				.with_difficulty(|x| x >= head.total_difficulty)
+				.connected()
+				.count();
+
 			// exit loop when:
 			// * we have more than MIN_PEERS more_or_same_work peers
 			// * we are synced already, e.g. grin was quickly restarted
 			// * timeout
 			if wp > MIN_PEERS
 				|| (wp == 0
-					&& self.peers.enough_peers()
+					&& self.peers.enough_outbound_peers()
 					&& head.total_difficulty > Difficulty::zero())
 				|| n > wait_secs
 			{
@@ -192,7 +200,8 @@ impl SyncRunner {
 			match self.sync_state.status() {
 				SyncStatus::TxHashsetDownload { .. }
 				| SyncStatus::TxHashsetSetup
-				| SyncStatus::TxHashsetValidation { .. }
+				| SyncStatus::TxHashsetRangeProofsValidation { .. }
+				| SyncStatus::TxHashsetKernelsValidation { .. }
 				| SyncStatus::TxHashsetSave
 				| SyncStatus::TxHashsetDone => check_state_sync = true,
 				_ => {
@@ -201,14 +210,8 @@ impl SyncRunner {
 						continue;
 					}
 
-					let check_run = match body_sync.check_run(&head, highest_height) {
-						Ok(v) => v,
-						Err(e) => {
-							error!("check_run failed: {:?}", e);
-							continue;
-						}
-					};
-
+					let check_run =
+						unwrap_or_restart_loop!(body_sync.check_run(&head, highest_height));
 					if check_run {
 						check_state_sync = true;
 					}
@@ -226,7 +229,23 @@ impl SyncRunner {
 	fn needs_syncing(&self) -> Result<(bool, u64), chain::Error> {
 		let local_diff = self.chain.head()?.total_difficulty;
 		let mut is_syncing = self.sync_state.is_syncing();
-		let peer = self.peers.most_work_peer();
+
+		// Find a peer with greatest known difficulty.
+		// Consider all peers, both inbound and outbound.
+		// We will prioritize syncing against outbound peers exclusively when possible.
+		// But we do support syncing against an inbound peer if greater work than any outbound peers.
+		let max_diff = self
+			.peers
+			.iter()
+			.connected()
+			.max_difficulty()
+			.unwrap_or(Difficulty::zero());
+		let peer = self
+			.peers
+			.iter()
+			.with_difficulty(|x| x >= max_diff)
+			.connected()
+			.choose_random();
 
 		let peer_info = if let Some(p) = peer {
 			p.info.clone()
@@ -266,7 +285,7 @@ impl SyncRunner {
 			};
 
 			let peer_diff = peer_info.total_difficulty();
-			if peer_diff > local_diff.clone() + threshold.clone() {
+			if peer_diff > local_diff + threshold {
 				info!(
 					"sync: total_difficulty {}, peer_difficulty {}, threshold {} (last 5 blocks), enabling sync",
 					local_diff,
